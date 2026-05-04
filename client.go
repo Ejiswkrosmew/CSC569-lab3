@@ -24,6 +24,72 @@ const (
 var start time.Time = time.Now()
 var self_node shared.Node
 
+func initiatePaxos(server *rpc.Client, membership *shared.Membership, myProposalNum int, proposedValue shared.PaxosValue) {
+	membership.Lock() //had to make setters for this to access from client
+	// create array of IDs to look through statically
+	//looking through the membership list this whole time
+	//would lock up the list
+	targetIDs := []int{}
+	for id := range membership.Members {
+		targetIDs = append(targetIDs, id)
+	}
+	membership.Unlock()
+
+	//define majoroity
+	numNodes := len(targetIDs)
+	majority := (numNodes / 2) + 1
+	
+	// prepare
+	fmt.Printf("\n[Paxos] Starting Prepare with ID %d\n", myProposalNum)
+	
+	promisesReceived := 0
+	valueToPropose := proposedValue
+
+	//send a prepare to every client in node list, count promises
+	for _, targetID := range targetIDs {
+		var reply shared.PromiseResponse //promise to be filled out by target
+		req := shared.PrepareRequest{ProposalNum: myProposalNum, TargetID: targetID} //prepare request being sent
+		
+		err := server.Call("PaxosManager.Prepare", req, &reply)
+		if err == nil && reply.Promise { //if we got a promise back for the given node increment counter
+			promisesReceived++
+		}
+	}
+
+	//did we get enough promises
+	if promisesReceived < majority {
+		fmt.Printf("[Paxos] Failed to reach majority, exiting paxos\n")
+		return
+	}
+
+	fmt.Printf("[Paxos] %d of %d required accepted. Value to propose: %s\n", promisesReceived, majority, valueToPropose)
+	// accept phase
+	fmt.Printf("[Paxos] Starting accept phase for value: %s\n", valueToPropose)
+	
+	acceptsReceived := 0
+	//send accept request to all nodes
+	for _, targetID := range targetIDs {
+		var accepted bool
+		req := shared.AcceptRequest{
+			ProposalNum: myProposalNum, 
+			Value: valueToPropose,
+			TargetID: targetID,
+		}
+		
+		err := server.Call("PaxosManager.Accept", req, &accepted) //do accept request logic on each client state
+		if err == nil && accepted {
+			acceptsReceived++ 
+		}
+	}
+
+	if acceptsReceived >= majority {
+		fmt.Printf("[Paxos] success. Value '%s' learned by majority (%d/%d).\n\n", valueToPropose, acceptsReceived, majority)
+	} else {
+		fmt.Printf("[Paxos] Consensus failed.\n")
+	}
+}
+
+
 // Send the current membership table to a neighboring node with the provided ID
 func sendMessage(server *rpc.Client, id int, membership *shared.Membership) {
 	req := shared.Request{ID: id, Table: membership}
@@ -117,6 +183,20 @@ func main() {
 	time.AfterFunc(time.Second*X_TIME, func() { runAfterX(server, &self_node, &membership, id) })
 	time.AfterFunc(time.Second*Y_TIME, func() { runAfterY(server, neighbors, &membership, id) })
 	time.AfterFunc(time.Second*time.Duration(Z_TIME), func() { runAfterZ(server, id) })
+
+	// initiate with keypress
+    go func() {
+		//infinite loop allow preparer to initiare on key press in the background
+        for {
+            fmt.Println("\n--- Press enter to initiate Paxos ---")
+            fmt.Scanln() 
+			//seed proposal number from timestamp and node id
+            proposalID := int(time.Now().Unix()%10000)*100 + id
+			//set value being proposed
+            val := shared.PaxosValue(fmt.Sprintf("Value-from-Node-%d", id))
+            initiatePaxos(server, membership, proposalID, val)
+        }
+    }()
 
 	wg.Add(1)
 	wg.Wait()

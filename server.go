@@ -11,6 +11,9 @@ func main() {
 	// create a Membership list
 	nodes := shared.NewMembership()
 	requests := shared.NewRequests()
+	//paxos stuff
+	paxosManager := shared.NewPaxosManager()
+	rpc.Register(paxosManager)
 
 	// register nodes with `rpc.DefaultServer`
 	rpc.Register(nodes)

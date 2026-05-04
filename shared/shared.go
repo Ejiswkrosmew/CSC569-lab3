@@ -12,6 +12,121 @@ const (
 	MAX_NODES = 8
 )
 
+// paxos structures
+//the value being transmitted will be a string
+type PaxosValue string
+
+// PrepareRequest
+type PrepareRequest struct {
+	ProposalNum int
+	TargetID int
+}
+
+// PromiseResponse
+type PromiseResponse struct {
+	Promise bool
+	LastAcceptedNum int
+	LastAcceptedValue PaxosValue
+}
+
+// AcceptRequest sent by Proposer
+type AcceptRequest struct {
+	ProposalNum int
+	Value PaxosValue
+	TargetID int
+}
+
+// status on each node
+type PaxosState struct {
+	mu sync.Mutex
+	PromisedNum int
+	AcceptedNum int
+	AcceptedValue PaxosValue
+}
+
+func NewPaxosState() *PaxosState {
+	return &PaxosState{
+		PromisedNum:   -1, //-1 so always lower when first init
+		AcceptedNum:   -1,
+		AcceptedValue: "", //empty to start
+	}
+}
+
+//place on the server to store the node states
+type PaxosManager struct {
+	mu     sync.Mutex
+	States map[int]*PaxosState
+}
+
+func NewPaxosManager() *PaxosManager {
+	return &PaxosManager{
+		States: make(map[int]*PaxosState),
+	}
+}
+
+func (ps *PaxosState) Prepare(req PrepareRequest, reply *PromiseResponse) error {
+	ps.mu.Lock()
+	defer ps.mu.Unlock()
+
+	if req.ProposalNum > ps.PromisedNum {
+		ps.PromisedNum = req.ProposalNum
+		
+		reply.Promise = true
+		reply.LastAcceptedNum = ps.AcceptedNum
+		reply.LastAcceptedValue = ps.AcceptedValue
+		
+		fmt.Printf("Node %d: Promised to proposal %d\n", req.TargetID, req.ProposalNum)
+	} else {
+		reply.Promise = false
+		fmt.Printf("Node %d: Rejected proposal %d (already promised to %d)\n", req.TargetID, req.ProposalNum, ps.PromisedNum)
+	}
+
+	return nil
+}
+
+//get the state of our target
+func (pm *PaxosManager) Prepare(req PrepareRequest, reply *PromiseResponse) error {
+	pm.mu.Lock()
+	//get client paxos state and if no state create one
+	state, ok := pm.States[req.TargetID]
+	if !ok {
+		state = NewPaxosState()
+		pm.States[req.TargetID] = state
+	}
+	pm.mu.Unlock()
+
+	return state.Prepare(req, reply) //actually do the logic on that state
+}
+
+// accept request
+func (pm *PaxosManager) Accept(req AcceptRequest, reply *bool) error {
+	//get state for target or create one
+	pm.mu.Lock()
+	state, ok := pm.States[req.TargetID]
+	if !ok {
+		state = NewPaxosState()
+		pm.States[req.TargetID] = state
+	}
+	pm.mu.Unlock()
+
+	//lock state and do logic
+	state.mu.Lock()
+	defer state.mu.Unlock()
+
+	//if number is equal to or higher than promise number we accept
+	if req.ProposalNum >= state.PromisedNum {
+		state.PromisedNum = req.ProposalNum
+		state.AcceptedNum = req.ProposalNum
+		state.AcceptedValue = req.Value
+		*reply = true
+		fmt.Printf("Node %d accepted '%s' for proposal numbered %d\n", req.TargetID, req.Value, req.ProposalNum)
+	} else {
+		*reply = false
+		fmt.Printf("Node %d rejected accept for proposal %d\n", req.TargetID, req.ProposalNum)
+	}
+	return nil
+}
+
 // Node struct represents a computing node.
 type Node struct {
 	ID        int
@@ -58,6 +173,15 @@ func NewMembership() *Membership {
 	return &Membership{
 		Members: make(map[int]Node),
 	}
+}
+
+//needed setters for membership mutex so client can lock list while reading
+func (m *Membership) Lock() {
+	m.mu.Lock()
+}
+
+func (m *Membership) Unlock() {
+	m.mu.Unlock()
 }
 
 // Adds a node to the membership list.
