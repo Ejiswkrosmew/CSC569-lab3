@@ -12,6 +12,15 @@ const (
 	MAX_NODES = 8
 )
 
+type RAFTNode struct {
+	State int // 0: follower, 1: candidate, 2: leader
+	Term  int
+	Vote  int
+	Votes int
+}
+
+/*---------------*/
+
 // Node struct represents a computing node.
 type Node struct {
 	ID        int
@@ -115,6 +124,39 @@ func (m *Membership) Get(payload int, reply *Node) error {
 	return nil
 }
 
+func (m *Membership) UpdateDead(currTime float64, t_fail float64, t_dead float64) {
+	m.mu.Lock()
+	for key, node := range m.Members {
+		if currTime-node.Time > t_dead {
+			delete(m.Members, key)
+		} else if currTime-node.Time > t_fail {
+			node.Alive = false
+			m.Members[key] = node
+		}
+	}
+	m.mu.Unlock()
+}
+
+func (m *Membership) Len() int {
+	m.mu.Lock()
+	ret := len(m.Members)
+	m.mu.Unlock()
+
+	return ret
+}
+
+func (m *Membership) Keys() []int {
+	m.mu.Lock()
+	ret := make([]int, len(m.Members))
+	i := 0
+	for k := range m.Members {
+		ret[i] = k
+		i++
+	}
+	m.mu.Unlock()
+	return ret
+}
+
 func (m *Membership) Print() {
 	m.mu.Lock()
 	for _, val := range m.Members {
@@ -126,6 +168,43 @@ func (m *Membership) Print() {
 	}
 	fmt.Println("")
 	m.mu.Unlock()
+}
+
+/*---------------*/
+
+type RAFTRequest struct {
+	To   int
+	From int
+	Term int
+	Type int // 0: request, 1: vote, 2: leader-ping
+}
+
+type RAFTRequests struct {
+	mu      sync.Mutex
+	Pending map[int][]RAFTRequest
+}
+
+func NewRAFTRequests() *RAFTRequests {
+	return &RAFTRequests{
+		Pending: make(map[int][]RAFTRequest),
+	}
+}
+
+func (r *RAFTRequests) Add(payload RAFTRequest, reply *bool) error {
+	r.mu.Lock()
+	r.Pending[payload.To] = append(r.Pending[payload.To], payload)
+	r.mu.Unlock()
+
+	return nil
+}
+
+func (r *RAFTRequests) Listen(ID int, reply *[]RAFTRequest) error {
+	r.mu.Lock()
+	*reply = r.Pending[ID]
+	r.Pending[ID] = []RAFTRequest{}
+	r.mu.Unlock()
+
+	return nil
 }
 
 /*---------------*/

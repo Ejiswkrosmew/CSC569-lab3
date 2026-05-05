@@ -12,17 +12,38 @@ import (
 )
 
 const (
-	MAX_NODES  = 8
-	X_TIME     = 1
-	Y_TIME     = 2
-	Z_TIME_MAX = 100
-	Z_TIME_MIN = 10
-	T_FAIL     = 10
-	T_CLEAN    = 2 * T_FAIL
+	MAX_NODES     = 8
+	X_TIME        = 1
+	Y_TIME        = 2
+	Z_TIME_MAX    = 100
+	Z_TIME_MIN    = 10
+	T_FAIL        = 10
+	T_CLEAN       = 2 * T_FAIL
+	CAND_TIME_MIN = 150 // ms
+	CAND_TIME_MAX = 300 // ms
+	RAFT_HB       = 50  // ms
 )
 
 var start time.Time = time.Now()
 var self_node shared.Node
+var self_RAFT_node shared.RAFTNode
+var election_timeout *time.Timer
+
+func broadcastRAFT(server *rpc.Client, req shared.RAFTRequest, membership *shared.Membership) {
+	for _, receiver := range (*membership).Keys() {
+		if receiver == req.From {
+			continue
+		}
+		newReq := shared.RAFTRequest{
+			To:   receiver,
+			From: req.From,
+			Term: req.Term,
+			Type: req.Type,
+		}
+		var reply bool
+		go server.Call("RAFTRequests.Add", newReq, &reply)
+	}
+}
 
 // Send the current membership table to a neighboring node with the provided ID
 func sendMessage(server *rpc.Client, id int, membership *shared.Membership) {
@@ -95,6 +116,7 @@ func main() {
 	currTime := calcTime()
 	// Construct self
 	self_node = shared.Node{ID: id, Hbcounter: 0, Time: currTime, Alive: true}
+	self_RAFT_node = shared.RAFTNode{State: 0, Term: 0, Vote: 0, Votes: 0}
 	var self_node_response shared.Node // Allocate space for a response to overwrite this
 
 	// Add node with input ID
@@ -118,8 +140,110 @@ func main() {
 	time.AfterFunc(time.Second*Y_TIME, func() { runAfterY(server, neighbors, &membership, id) })
 	time.AfterFunc(time.Second*time.Duration(Z_TIME), func() { runAfterZ(server, id) })
 
+	// Delaying the election until the membership table is probably filled
+	fmt.Printf("Waiting %d seconds for the membership list to fill out...\n", Y_TIME*3)
+	election_timeout = time.AfterFunc(time.Second*Y_TIME*3+time.Millisecond*time.Duration(rand.Float32()*(CAND_TIME_MAX-CAND_TIME_MIN)+CAND_TIME_MIN), func() { runElectionLoop(server, &self_RAFT_node, &membership, id, &election_timeout) })
+	time.AfterFunc(time.Second*Y_TIME*3+time.Millisecond*RAFT_HB, func() { runRAFTHB(server, &self_RAFT_node, &membership, id, &election_timeout) })
+
 	wg.Add(1)
 	wg.Wait()
+}
+
+func runElectionLoop(server *rpc.Client, node *shared.RAFTNode, membership **shared.Membership, id int, election_timeout **time.Timer) {
+	*election_timeout = time.AfterFunc(time.Millisecond*time.Duration(rand.Float32()*(CAND_TIME_MAX-CAND_TIME_MIN)+CAND_TIME_MIN), func() { runElectionLoop(server, node, membership, id, election_timeout) })
+
+	// New term
+	node.Term++
+
+	// Now a candidate
+	node.State = 1
+
+	// Broadcast vote request
+	req := shared.RAFTRequest{
+		From: id,
+		Term: node.Term,
+		Type: 0,
+	}
+	broadcastRAFT(server, req, *membership)
+
+	fmt.Printf("\nNODE %d (%.2fs): Leader ping timed out. Now becoming a candidate for term %d\n", id, time.Since(start).Seconds(), node.Term)
+}
+
+func runRAFTHB(server *rpc.Client, node *shared.RAFTNode, membership **shared.Membership, id int, election_timeout **time.Timer) {
+	time.AfterFunc(time.Millisecond*RAFT_HB, func() { runRAFTHB(server, node, membership, id, election_timeout) })
+
+	var reply []shared.RAFTRequest
+	server.Call("RAFTRequests.Listen", id, &reply)
+
+	for _, req := range reply {
+		// If a new term is decalred, self now starts as a follower
+		if req.Term > node.Term {
+			node.Term = req.Term
+			node.State = 0
+			node.Vote = 0
+			node.Votes = 0
+			fmt.Printf("\nNODE %d (%.2fs): New term received (%d)\n", id, time.Since(start).Seconds(), node.Term)
+		}
+
+		// If an old term, ignore
+		if req.Term < node.Term {
+			continue
+		}
+
+		switch req.Type {
+		case 0: // Requesting Vote
+			if node.State != 0 || node.Vote != 0 {
+				// No-op if not a follower or already promised a vote
+				continue
+			}
+
+			// Vote for requester and reset the timeout
+			node.Vote = req.From
+			response := shared.RAFTRequest{
+				To:   req.From,
+				From: id,
+				Term: node.Term,
+				Type: 1,
+			}
+			var reply bool
+			server.Call("RAFTRequests.Add", response, &reply)
+			(*election_timeout).Reset(time.Millisecond * time.Duration(rand.Float32()*(CAND_TIME_MAX-CAND_TIME_MIN)+CAND_TIME_MIN))
+
+			fmt.Printf("NODE %d (%.2fs): Now voting for %d\n", id, time.Since(start).Seconds(), req.From)
+		case 1: // Promised Vote
+			if node.State != 1 {
+				// No-op if not a candidate
+				continue
+			}
+
+			// Vote received
+			node.Votes++
+			fmt.Printf("NODE %d (%.2fs): Received a vote from %d (votes: %d/%d)\n", id, time.Since(start).Seconds(), req.From, node.Votes, (*membership).Len())
+
+			if node.Votes > (*membership).Len()/2 {
+				// If majority, now a leader
+				node.State = 2
+				(*election_timeout).Stop()
+				fmt.Printf("\tMajority votes received. Now a leader\n")
+			}
+		case 2: // Leader Ping
+			node.State = 0
+			node.Vote = req.From
+			// fmt.Printf("NODE %d (%.2fs): Leader ping from %d received\n", time.Since(start).Seconds(), req.From)
+			(*election_timeout).Reset(time.Millisecond * time.Duration(rand.Float32()*(CAND_TIME_MAX-CAND_TIME_MIN)+CAND_TIME_MIN))
+		}
+	}
+
+	// Broadcast leader ping to all nodes if leader
+	if node.State == 2 {
+		req := shared.RAFTRequest{
+			From: id,
+			Term: node.Term,
+			Type: 2,
+		}
+		broadcastRAFT(server, req, *membership)
+		// fmt.Printf("NODE %d (%.2fs): Leader Broadcast performed\n", id, time.Since(start).Seconds(), req.From)
+	}
 }
 
 func runAfterX(server *rpc.Client, node *shared.Node, membership **shared.Membership, id int) {
@@ -136,15 +260,7 @@ func runAfterX(server *rpc.Client, node *shared.Node, membership **shared.Member
 	*membership = shared.CombineTables(*membership, newMem)
 
 	// Dead checker
-	currTime := calcTime()
-	for key, node := range (*membership).Members {
-		if currTime-node.Time > T_CLEAN {
-			delete((*membership).Members, key)
-		} else if currTime-node.Time > T_FAIL {
-			node.Alive = false
-			(*membership).Members[key] = node
-		}
-	}
+	(*membership).UpdateDead(calcTime(), T_FAIL, T_CLEAN)
 }
 
 func runAfterY(server *rpc.Client, neighbors [2]int, membership **shared.Membership, id int) {
@@ -155,7 +271,7 @@ func runAfterY(server *rpc.Client, neighbors [2]int, membership **shared.Members
 	// fmt.Printf("Neighbor %d was chosen\n", neighbor)
 	sendMessage(server, neighbor, *membership)
 
-	(*membership).Print()
+	// (*membership).Print()
 }
 
 func runAfterZ(server *rpc.Client, id int) {
