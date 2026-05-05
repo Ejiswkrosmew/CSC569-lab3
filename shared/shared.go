@@ -13,10 +13,11 @@ const (
 )
 
 type RAFTNode struct {
-	State int // 0: follower, 1: candidate, 2: leader
-	Term  int
-	Vote  int
-	Votes int
+	State  int // 0: follower, 1: candidate, 2: leader
+	Term   int
+	Vote   int
+	Votes  int
+	Leader int
 }
 
 /*---------------*/

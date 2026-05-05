@@ -19,6 +19,7 @@ const (
 	Z_TIME_MIN    = 10
 	T_FAIL        = 10
 	T_CLEAN       = 2 * T_FAIL
+	RAFT_DELAY    = 5 * Y_TIME
 	CAND_TIME_MIN = 150 // ms
 	CAND_TIME_MAX = 300 // ms
 	RAFT_HB       = 50  // ms
@@ -141,9 +142,9 @@ func main() {
 	time.AfterFunc(time.Second*time.Duration(Z_TIME), func() { runAfterZ(server, id) })
 
 	// Delaying the election until the membership table is probably filled
-	fmt.Printf("Waiting %d seconds for the membership list to fill out...\n", Y_TIME*3)
-	election_timeout = time.AfterFunc(time.Second*Y_TIME*3+time.Millisecond*time.Duration(rand.Float32()*(CAND_TIME_MAX-CAND_TIME_MIN)+CAND_TIME_MIN), func() { runElectionLoop(server, &self_RAFT_node, &membership, id, &election_timeout) })
-	time.AfterFunc(time.Second*Y_TIME*3+time.Millisecond*RAFT_HB, func() { runRAFTHB(server, &self_RAFT_node, &membership, id, &election_timeout) })
+	fmt.Printf("Waiting %d seconds for the membership list to fill out...\n", RAFT_DELAY)
+	election_timeout = time.AfterFunc(time.Second*RAFT_DELAY+time.Millisecond*time.Duration(rand.Float32()*(CAND_TIME_MAX-CAND_TIME_MIN)+CAND_TIME_MIN), func() { runElectionLoop(server, &self_RAFT_node, &membership, id, &election_timeout) })
+	time.AfterFunc(time.Millisecond*RAFT_HB, func() { runRAFTHB(server, &self_RAFT_node, &membership, id, &election_timeout) })
 
 	wg.Add(1)
 	wg.Wait()
@@ -181,6 +182,7 @@ func runRAFTHB(server *rpc.Client, node *shared.RAFTNode, membership **shared.Me
 			node.Term = req.Term
 			node.State = 0
 			node.Vote = 0
+			node.Leader = 0
 			node.Votes = 0
 			fmt.Printf("\nNODE %d (%.2fs): New term received (%d)\n", id, time.Since(start).Seconds(), node.Term)
 		}
@@ -219,19 +221,24 @@ func runRAFTHB(server *rpc.Client, node *shared.RAFTNode, membership **shared.Me
 			// Vote received
 			node.Votes++
 			fmt.Printf("NODE %d (%.2fs): Received a vote from %d (votes: %d/%d)\n", id, time.Since(start).Seconds(), req.From, node.Votes, (*membership).Len())
-
-			if node.Votes > (*membership).Len()/2 {
-				// If majority, now a leader
-				node.State = 2
-				(*election_timeout).Stop()
-				fmt.Printf("\tMajority votes received. Now a leader\n")
-			}
 		case 2: // Leader Ping
+			if node.Leader != req.From {
+				fmt.Printf("NODE %d (%.2fs): Leader %d acknowledged\n", id, time.Since(start).Seconds(), req.From)
+			}
+
 			node.State = 0
-			node.Vote = req.From
-			// fmt.Printf("NODE %d (%.2fs): Leader ping from %d received\n", time.Since(start).Seconds(), req.From)
+			node.Leader = req.From
+
 			(*election_timeout).Reset(time.Millisecond * time.Duration(rand.Float32()*(CAND_TIME_MAX-CAND_TIME_MIN)+CAND_TIME_MIN))
 		}
+	}
+
+	// Check if, as a candidate, majority votes were received
+	if node.State == 1 && node.Votes >= (*membership).Len()/2+1 {
+		// If majority, now a leader
+		node.State = 2
+		(*election_timeout).Stop()
+		fmt.Printf("NODE %d (%.2fs): ELECTED AS LEADER\n", id, time.Since(start).Seconds())
 	}
 
 	// Broadcast leader ping to all nodes if leader
