@@ -25,6 +25,7 @@ var start time.Time = time.Now()
 var self_node shared.Node
 
 func initiatePaxos(server *rpc.Client, membership *shared.Membership, myProposalNum int, proposedValue shared.PaxosValue) {
+	time_start := time.Now()
 	membership.Lock() //had to make setters for this to access from client
 	// create array of IDs to look through statically
 	//looking through the membership list this whole time
@@ -87,6 +88,7 @@ func initiatePaxos(server *rpc.Client, membership *shared.Membership, myProposal
 	} else {
 		fmt.Printf("[Paxos] Consensus failed.\n")
 	}
+	fmt.Printf("time taken to reach consensus: %f",  time.Since(time_start).Seconds())
 }
 
 
