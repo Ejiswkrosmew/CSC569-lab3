@@ -3,16 +3,20 @@ package main
 import (
 	"fmt"
 	"lab3/shared"
+	"io/ioutil"
+	"sort"
 	"math/rand"
 	"net/rpc"
 	"os"
-	"strconv"
 	"sync"
 	"time"
+	"unicode"
+	"strings"
+	"strconv"
 )
 
 const (
-	MAX_NODES     = 8
+	MAX_NODES     = 4
 	X_TIME        = 1
 	Y_TIME        = 2
 	Z_TIME_MAX    = 100
@@ -25,10 +29,14 @@ const (
 	RAFT_HB       = 50  // ms
 )
 
+
+var isWorking = false
+
 var start time.Time = time.Now()
 var self_node shared.Node
 var self_RAFT_node shared.RAFTNode
 var election_timeout *time.Timer
+
 
 func broadcastRAFT(server *rpc.Client, req shared.RAFTRequest, membership *shared.Membership) {
 	for _, receiver := range (*membership).Keys() {
@@ -139,25 +147,38 @@ func main() {
 
 	time.AfterFunc(time.Second*X_TIME, func() { runAfterX(server, &self_node, &membership, id) })
 	time.AfterFunc(time.Second*Y_TIME, func() { runAfterY(server, neighbors, &membership, id) })
-	time.AfterFunc(time.Second*time.Duration(Z_TIME), func() { runAfterZ(server, id) })
+	//time.AfterFunc(time.Second*time.Duration(Z_TIME), func() { runAfterZ(server, id) })
 
 	// Delaying the election until the membership table is probably filled
 	fmt.Printf("Waiting %d seconds for the membership list to fill out...\n", RAFT_DELAY)
 	election_timeout = time.AfterFunc(time.Second*RAFT_DELAY+time.Millisecond*time.Duration(rand.Float32()*(CAND_TIME_MAX-CAND_TIME_MIN)+CAND_TIME_MIN), func() { runElectionLoop(server, &self_RAFT_node, &membership, id, &election_timeout) })
 	time.AfterFunc(time.Millisecond*RAFT_HB, func() { runRAFTHB(server, &self_RAFT_node, &membership, id, &election_timeout) })
 
+	//dedicated worker loop
+	time.AfterFunc(time.Second*RAFT_DELAY, func() { runWorkerExecutionLoop(server, id) })
+
 	wg.Add(1)
 	wg.Wait()
 }
 
 func runElectionLoop(server *rpc.Client, node *shared.RAFTNode, membership **shared.Membership, id int, election_timeout **time.Timer) {
-	*election_timeout = time.AfterFunc(time.Millisecond*time.Duration(rand.Float32()*(CAND_TIME_MAX-CAND_TIME_MIN)+CAND_TIME_MIN), func() { runElectionLoop(server, node, membership, id, election_timeout) })
+	// CRITICAL FIX: Stop the old timer if it exists before assigning a new one
+	if *election_timeout != nil {
+		(*election_timeout).Stop()
+	}
 
-	// New term
+	// Schedule the next potential election timeout window safely
+	*election_timeout = time.AfterFunc(time.Millisecond*time.Duration(rand.Float32()*(CAND_TIME_MAX-CAND_TIME_MIN)+CAND_TIME_MIN), func() { 
+		runElectionLoop(server, node, membership, id, election_timeout) 
+	})
+
+	// New term increment
 	node.Term++
 
 	// Now a candidate
 	node.State = 1
+	node.Vote = id     //A candidate always votes for itself first!
+	node.Votes = 1     //Start with 1 vote (your own)
 
 	// Broadcast vote request
 	req := shared.RAFTRequest{
@@ -239,6 +260,30 @@ func runRAFTHB(server *rpc.Client, node *shared.RAFTNode, membership **shared.Me
 		node.State = 2
 		(*election_timeout).Stop()
 		fmt.Printf("NODE %d (%.2fs): ELECTED AS LEADER\n", id, time.Since(start).Seconds())
+
+
+		// check for dead workers, set those tasks to not started
+		go func() {
+			for {
+				time.Sleep(2 * time.Second)
+				shared.MRMutex.Lock()
+				now := time.Now()
+				for key, startTime := range shared.TaskTimestamps {
+					if now.Sub(startTime) > 10*time.Second { // 10-second timeout
+						var taskID int
+						if strings.HasPrefix(key, "map-") {
+							fmt.Sscanf(key, "map-%d", &taskID)
+							shared.MapTasks[taskID] = 0 // wipe progress set to idle
+						} else {
+							fmt.Sscanf(key, "reduce-%d", &taskID)
+							shared.ReduceTasks[taskID] = 0 // wipe progress reset to idle
+						}
+						delete(shared.TaskTimestamps, key) //remove task
+					}
+				}
+				shared.MRMutex.Unlock()
+			}
+		}()
 	}
 
 	// Broadcast leader ping to all nodes if leader
@@ -251,6 +296,8 @@ func runRAFTHB(server *rpc.Client, node *shared.RAFTNode, membership **shared.Me
 		broadcastRAFT(server, req, *membership)
 		// fmt.Printf("NODE %d (%.2fs): Leader Broadcast performed\n", id, time.Since(start).Seconds(), req.From)
 	}
+
+	
 }
 
 func runAfterX(server *rpc.Client, node *shared.Node, membership **shared.Membership, id int) {
@@ -284,4 +331,197 @@ func runAfterY(server *rpc.Client, neighbors [2]int, membership **shared.Members
 func runAfterZ(server *rpc.Client, id int) {
 	fmt.Printf("NODE %d FAILED\n", id)
 	os.Exit(1)
+}
+
+//actual map and reduce funcs
+func Map(filename string, contents string) []KeyValue {
+	// Function to detect word separators (returns true if the character is NOT a letter)
+	ff := func(r rune) bool { return !unicode.IsLetter(r) }
+
+	// Split contents into an array of clean words based on our separator function
+	words := strings.FieldsFunc(contents, ff)
+
+	kva := []KeyValue{}
+	for _, w := range words {
+		// Create a key-value pair for each word found
+		kv := KeyValue{Key: w, Value: "1"}
+		kva = append(kva, kv)
+	}
+	return kva
+}
+
+func Reduce(key string, values []string) string {
+	// Return the total number of occurrences of this word as a string
+	return strconv.Itoa(len(values))
+}
+
+//assign buckets
+func getBucket(word string, nReduce int) int {
+	sum := 0
+	for _, r := range word {
+		sum += int(r)
+	}
+	return sum % nReduce
+}
+
+func executeSimpleMap(taskID int, filename string, nReduce int, server *rpc.Client) {
+	// 1. Open and read the raw content of the input file
+	file, err := os.Open(filename)
+	if err != nil {
+		fmt.Printf("Worker Error: Cannot open file %v\n", filename)
+		return
+	}
+	content, err := ioutil.ReadAll(file)
+	if err != nil {
+		fmt.Printf("Worker Error: Cannot read file %v\n", filename)
+		file.Close()
+		return
+	}
+	file.Close()
+
+	// 2. Process contents into a slice of individual words paired with "1"
+	kva := Map(filename, string(content))
+
+	// 3. Open file handles for each of our destination partition buckets
+	files := make([]*os.File, nReduce)
+	for b := 0; b < nReduce; b++ {
+		outName := fmt.Sprintf("mr-%d-%d", taskID, b)
+		f, err := os.Create(outName)
+		if err != nil {
+			fmt.Printf("Worker Error: Cannot create partition file %s\n", outName)
+			return
+		}
+		files[b] = f
+	}
+
+	// 4. Distribute each KeyValue pair into its calculated bucket file
+	for _, kv := range kva {
+		b := getBucket(kv.Key, nReduce)
+		// Write out as clear plain text lines: "word 1"
+		fmt.Fprintf(files[b], "%s %s\n", kv.Key, kv.Value)
+	}
+
+	// Close all partition files to flush the data to disk
+	for b := 0; b < nReduce; b++ {
+		files[b].Close()
+	}
+
+	// 5. Notify the RAFT Leader that this Map task successfully completed
+	var reply bool
+	args := shared.CompleteTaskArgs{TaskType: 1, TaskID: taskID}
+	server.Call("Coordinator.CompleteTask", &args, &reply)
+}
+
+func executeSimpleReduce(taskID int, nMap int, server *rpc.Client) {
+	intermediate := []KeyValue{}
+
+	// 1. Collect intermediate files from all Map tasks for this bucket partition ID
+	for m := 0; m < nMap; m++ {
+		inName := fmt.Sprintf("mr-%d-%d", m, taskID)
+		file, err := os.Open(inName)
+		if err != nil {
+			continue // Safe to skip if a Map task didn't produce keys for this specific bucket
+		}
+
+		var key, val string
+		// Read lines sequentially
+		for {
+			_, err := fmt.Fscanf(file, "%s %s\n", &key, &val)
+			if err != nil {
+				break // Hit EOF, break out to stop reading this specific file
+			}
+			intermediate = append(intermediate, KeyValue{Key: key, Value: val})
+		}
+		file.Close()
+	}
+
+	// 2. Sort the collected slice so identical words are forced into adjacent positions
+	sort.Sort(ByKey(intermediate))
+
+	// 3. Open the final aggregated word count file
+	outName := fmt.Sprintf("mr-out-%d", taskID)
+	ofile, err := os.Create(outName)
+	if err != nil {
+		fmt.Printf("Worker Error: Cannot create output file %s\n", outName)
+		return
+	}
+
+	// 4. Process identical key blocks sequentially using a two-pointer sliding window
+	i := 0
+	for i < len(intermediate) {
+		j := i + 1
+		// Advance 'j' as long as the sequential key tokens match perfectly
+		for j < len(intermediate) && intermediate[j].Key == intermediate[i].Key {
+			j++
+		}
+		
+		// Collect all the value strings (which will just be strings of "1")
+		values := []string{}
+		for k := i; k < j; k++ {
+			values = append(values, intermediate[k].Value)
+		}
+		
+		// Execute the Reduce function to count the size of the value slice
+		output := Reduce(intermediate[i].Key, values)
+
+		// Print the final result formatted to disk: "word count"
+		fmt.Fprintf(ofile, "%v %v\n", intermediate[i].Key, output)
+
+		// Advance your index anchor over to the next unique word sequence
+		i = j
+	}
+	ofile.Close()
+
+	// 5. Notify the RAFT Leader that this Reduce task successfully completed
+	var reply bool
+	args := shared.CompleteTaskArgs{TaskType: 2, TaskID: taskID}
+	server.Call("Coordinator.CompleteTask", &args, &reply)
+}
+
+// Intermediate data structure
+type KeyValue struct {
+	Key   string
+	Value string
+}
+
+type ByKey []KeyValue
+
+func (a ByKey) Len() int          { return len(a) } 
+func (a ByKey) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
+func (a ByKey) Less(i, j int) bool { return a[i].Key < a[j].Key }
+
+
+func runWorkerExecutionLoop(server *rpc.Client, id int) {
+	// Re-queue this function to evaluate every 500ms
+	time.AfterFunc(500*time.Millisecond, func() { runWorkerExecutionLoop(server, id) })
+
+	// Only request tasks if I am a healthy follower, I know who the leader is, and I am not busy
+	if self_RAFT_node.State == 0 && self_RAFT_node.Leader != 0 && !isWorking {
+		isWorking = true
+		
+		go func() {
+			var reply shared.TaskReply
+			args := shared.TaskRequest{WorkerID: id}
+			
+			err := server.Call("Coordinator.GiveOutTask", &args, &reply)
+			if err == nil {
+				switch reply.TaskType {
+				case 1: // Map Task
+					fmt.Printf("NODE %d: Received Map Task %d (%s)\n", id, reply.TaskID, reply.Filename)
+					executeSimpleMap(reply.TaskID, reply.Filename, reply.NReduce, server)
+					isWorking = false // Task finished, reset flag
+				case 2: // Reduce Task
+					fmt.Printf("NODE %d: Received Reduce Task %d\n", id, reply.TaskID)
+					executeSimpleReduce(reply.TaskID, reply.NMap, server)
+					isWorking = false // Task finished, reset flag
+				default:
+					// Type 0 (Wait) or Type 3 (All Done)
+					isWorking = false
+				}
+			} else {
+				// Server error or connection dropped temporarily
+				isWorking = false
+			}
+		}()
+	}
 }

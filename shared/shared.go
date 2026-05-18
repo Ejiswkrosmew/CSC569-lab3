@@ -9,8 +9,40 @@ import (
 )
 
 const (
-	MAX_NODES = 8
+	MAX_NODES = 4
 )
+
+//-- map reduce stuff
+
+var InputFiles = []string{"pg-being_ernest.txt", "pg-metamorphosis.txt"}
+var NReduce = 3
+
+// Task tracking: 0 = Idle, 1 = In Progress, 2 = Completed
+var MapTasks []int
+var ReduceTasks []int
+var TaskTimestamps map[string]time.Time
+
+var MRMutex sync.Mutex
+
+type Coordinator struct{} //for registering to server
+
+type TaskRequest struct {
+	WorkerID int
+}
+
+type TaskReply struct {
+	TaskType int    // 0 = Wait, 1 = Map, 2 = Reduce, 3 = All Done
+	TaskID   int    
+	Filename string
+	NReduce  int   
+	NMap     int   
+}
+
+type CompleteTaskArgs struct {
+	TaskType int // 1 = Map, 2 = Reduce
+	TaskID   int
+}
+
 
 type RAFTNode struct {
 	State  int // 0: follower, 1: candidate, 2: leader
@@ -39,15 +71,22 @@ func (n Node) CrashTime() int {
 }
 
 func (n Node) InitializeNeighbors(id int) [2]int {
-	neighbor1 := RandInt()
-	for neighbor1 == id {
-		neighbor1 = RandInt()
+	// If you are running exactly nodes 1, 2, 3, and 4:
+	// We want a ring: 1 -> 2 -> 3 -> 4 -> 1
+	
+	// Find neighbor ahead
+	next := id + 1
+	if next > 4 {
+		next = 1
 	}
-	neighbor2 := RandInt()
-	for neighbor1 == neighbor2 || neighbor2 == id {
-		neighbor2 = RandInt()
+
+	// Find neighbor behind
+	prev := id - 1
+	if prev < 1 {
+		prev = 4
 	}
-	return [2]int{neighbor1, neighbor2}
+
+	return [2]int{next, prev}
 }
 
 func RandInt() int {
@@ -324,3 +363,74 @@ func CombineTables(table1 *Membership, table2 *Membership) *Membership {
 
 	return ret
 }
+
+//mapreduce stuff
+
+func (c *Coordinator) GiveOutTask(args *TaskRequest, reply *TaskReply) error {
+	MRMutex.Lock()
+	defer MRMutex.Unlock()
+
+	fmt.Printf("Leader: Received TaskRequest from Worker %d\n", args.WorkerID)
+
+	//assign tasks
+	allMapsDone := true
+	for i, status := range MapTasks {
+		if status == 0 { // Idle
+			MapTasks[i] = 1 // Mark In Progress
+			TaskTimestamps[fmt.Sprintf("map-%d", i)] = time.Now()
+
+			reply.TaskType = 1
+			reply.TaskID = i
+			reply.Filename = InputFiles[i]
+			reply.NReduce = NReduce
+			return nil
+		}
+		if status != 2 {
+			fmt.Printf("Leader: Telling Worker %d to WAIT. Map tasks are still in progress.\n", args.WorkerID)
+			allMapsDone = false
+		}
+	}
+
+	// workers must wait
+	if !allMapsDone {
+		reply.TaskType = 0
+		return nil
+	}
+
+	// 3. Check Reduce Phase
+	for i, status := range ReduceTasks {
+		if status == 0 { // Idle
+			ReduceTasks[i] = 1 // Mark In Progress
+			TaskTimestamps[fmt.Sprintf("reduce-%d", i)] = time.Now()
+
+			reply.TaskType = 2
+			reply.TaskID = i
+			reply.NMap = len(InputFiles)
+			return nil
+		}
+	}
+
+	// 4. Job Complete
+	reply.TaskType = 3
+	fmt.Printf("Leader: Telling Worker %d all tasks are COMPLETED.\n", args.WorkerID)
+	return nil
+}
+
+func (c *Coordinator) CompleteTask(args *CompleteTaskArgs, reply *bool) error {
+	MRMutex.Lock()
+	defer MRMutex.Unlock()
+
+	//rmark map done
+	if args.TaskType == 1 {
+		MapTasks[args.TaskID] = 2
+		delete(TaskTimestamps, fmt.Sprintf("map-%d", args.TaskID))
+	//mark reduce done
+	} else if args.TaskType == 2 {
+		ReduceTasks[args.TaskID] = 2
+		delete(TaskTimestamps, fmt.Sprintf("reduce-%d", args.TaskID))
+	}
+
+	*reply = true
+	return nil
+}
+

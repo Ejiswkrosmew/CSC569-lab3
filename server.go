@@ -5,6 +5,7 @@ import (
 	"lab3/shared"
 	"net/http"
 	"net/rpc"
+	"time"
 )
 
 func main() {
@@ -12,6 +13,16 @@ func main() {
 	nodes := shared.NewMembership()
 	requests := shared.NewRequests()
 	RAFTrequests := shared.NewRAFTRequests()
+
+	//init mr stuff
+	shared.MRMutex.Lock()
+	shared.MapTasks = make([]int, len(shared.InputFiles))
+	shared.ReduceTasks = make([]int, shared.NReduce)
+	shared.TaskTimestamps = make(map[string]time.Time)
+	shared.MRMutex.Unlock()
+
+	coordinator := new(shared.Coordinator)
+	rpc.Register(coordinator) //mapreduce register
 
 	// register nodes with `rpc.DefaultServer`
 	rpc.Register(nodes)
