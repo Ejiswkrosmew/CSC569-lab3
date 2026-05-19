@@ -6,6 +6,7 @@ import (
 	"math/rand"
 	"sync"
 	"time"
+	"strings"
 )
 
 const (
@@ -467,12 +468,39 @@ func (c *Coordinator) CompleteTask(args *CompleteTaskArgs, reply *bool) error {
 }
 
 // GetLog allows the client-side RAFT Leader node to pull down staged logs from the server
-func (c *Coordinator) GetLog(args int, reply *[]LogEntry) error {
+func (c *Coordinator) GetLog(leaderCommit int, reply *[]LogEntry) error {
 	MRMutex.Lock()
 	defer MRMutex.Unlock()
 	
 	// Create a deep slice copy to prevent concurrent thread manipulation race conditions
 	*reply = append([]LogEntry{}, c.Log...)
+
+	//update state based on logs
+	if leaderCommit >= 0 && leaderCommit < len(c.Log) {
+		for i := 0; i <= leaderCommit; i++ {
+			entry := c.Log[i]
+			var taskID, workerID int
+			
+			if strings.HasPrefix(entry.Entry, "Assign-Map-") {
+				fmt.Sscanf(entry.Entry, "Assign-Map-%d-Worker-%d", &taskID, &workerID)
+				if MapTasks[taskID] == 0 { // Only advance if it's currently idle
+					MapTasks[taskID] = 1 // Mark In Progress
+				}
+			} else if strings.HasPrefix(entry.Entry, "Complete-Map-") {
+				fmt.Sscanf(entry.Entry, "Complete-Map-%d", &taskID)
+				MapTasks[taskID] = 2 // Mark Completed
+			} else if strings.HasPrefix(entry.Entry, "Assign-Reduce-") {
+				fmt.Sscanf(entry.Entry, "Assign-Reduce-%d-Worker-%d", &taskID, &workerID)
+				if ReduceTasks[taskID] == 0 {
+					ReduceTasks[taskID] = 1 // Mark In Progress
+				}
+			} else if strings.HasPrefix(entry.Entry, "Complete-Reduce-") {
+				fmt.Sscanf(entry.Entry, "Complete-Reduce-%d", &taskID)
+				ReduceTasks[taskID] = 2 // Mark Completed
+			}
+		}
+	}
+
 	return nil
 }
 

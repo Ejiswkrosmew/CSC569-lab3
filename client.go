@@ -129,7 +129,13 @@ func main() {
 		Log: []shared.LogEntry{},
 		CommitIndex: -1,
 		LastApplied: -1,
-		}
+	}
+	shared.MRMutex.Lock()
+	shared.MapTasks = make([]int, len(shared.InputFiles))
+	shared.ReduceTasks = make([]int, shared.NReduce)
+	shared.TaskTimestamps = make(map[string]time.Time)
+	shared.MRMutex.Unlock()
+	
 	var self_node_response shared.Node // Allocate space for a response to overwrite this
 
 	// Add node with input ID
@@ -246,15 +252,118 @@ func runRAFTHB(server *rpc.Client, node *shared.RAFTNode, membership **shared.Me
 			// Vote received
 			node.Votes++
 			fmt.Printf("NODE %d (%.2fs): Received a vote from %d (votes: %d/%d)\n", id, time.Since(start).Seconds(), req.From, node.Votes, (*membership).Len())
-		case 2: // Leader Ping
-			if node.Leader != req.From {
-				fmt.Printf("NODE %d (%.2fs): Leader %d acknowledged\n", id, time.Since(start).Seconds(), req.From)
+		case 2: // AppendEntries / Log Replication Frame
+			shared.MRMutex.Lock()
+
+			// 1. Decline if incoming term is older than ours
+			if req.Term < node.Term {
+				rejectOld := shared.RAFTRequest{
+					To: req.From, From: id, Term: node.Term, Type: 3, Success: false, PrevLogIndex: -1,
+				}
+				var b bool
+				server.Call("RAFTRequests.Add", rejectOld, &b)
+				shared.MRMutex.Unlock()
+				continue 
 			}
 
 			node.State = 0
 			node.Leader = req.From
-
 			(*election_timeout).Reset(time.Millisecond * time.Duration(rand.Float32()*(CAND_TIME_MAX-CAND_TIME_MIN)+CAND_TIME_MIN))
+
+			// 2. Validate log history consistency matching leader's history
+			if req.PrevLogIndex >= 0 && (req.PrevLogIndex >= len(node.Log) || node.Log[req.PrevLogIndex].Term != req.PrevLogTerm) {
+				rejectReply := shared.RAFTRequest{
+					To: req.From, From: id, Term: node.Term, Type: 3, Success: false, PrevLogIndex: req.PrevLogIndex,
+				}
+				var b bool
+				server.Call("RAFTRequests.Add", rejectReply, &b)
+				shared.MRMutex.Unlock()
+				continue
+			}
+
+			// 3. Append new entries by identifying and resolving array conflicts
+			insertIndex := req.PrevLogIndex + 1
+			if len(req.Entries) > 0 {
+				for i, entry := range req.Entries {
+					currentIdx := insertIndex + i
+
+					//isolate the entry
+					safeEntry := shared.LogEntry{
+						Entry: entry.Entry,
+						Term:  entry.Term,
+					}
+
+					if currentIdx < len(node.Log) {
+						if node.Log[currentIdx].Term != safeEntry.Term {
+							node.Log = node.Log[:currentIdx]
+							node.Log = append(node.Log, safeEntry)
+						}
+					} else {
+						node.Log = append(node.Log, safeEntry)
+						break
+					}
+				}
+				fmt.Printf("NODE %d: Log Synchronized. Total Log Size: %d\n", id, len(node.Log))
+			}
+
+			// 4. Update commit index tracking boundaries safely
+			if req.LeaderCommit > node.CommitIndex {
+				targetCommit := req.LeaderCommit
+				if targetCommit > len(node.Log)-1 {
+					targetCommit = len(node.Log) - 1
+				}
+				
+				if targetCommit > node.CommitIndex {
+					node.CommitIndex = targetCommit
+					fmt.Printf("NODE %d: Advanced CommitIndex to %d\n", id, node.CommitIndex)
+
+					// Rebuild local operational states from verified logs
+					for node.LastApplied < node.CommitIndex {
+						nextApp := node.LastApplied + 1
+						
+						if nextApp >= len(node.Log) || nextApp < 0 || len(node.Log) == 0 {
+							break 
+						}
+						
+						node.LastApplied = nextApp
+						entry := node.Log[node.LastApplied]
+						
+						var taskID, workerID int
+						// Match against your field named "Entry"
+						if strings.HasPrefix(entry.Entry, "Assign-Map-") {
+							fmt.Sscanf(entry.Entry, "Assign-Map-%d-Worker-%d", &taskID, &workerID)
+							shared.MapTasks[taskID] = 1
+							shared.TaskTimestamps[fmt.Sprintf("map-%d", taskID)] = time.Now()
+						} else if strings.HasPrefix(entry.Entry, "Complete-Map-") {
+							fmt.Sscanf(entry.Entry, "Complete-Map-%d", &taskID)
+							shared.MapTasks[taskID] = 2
+							delete(shared.TaskTimestamps, fmt.Sprintf("map-%d", taskID))
+						} else if strings.HasPrefix(entry.Entry, "Assign-Reduce-") {
+							fmt.Sscanf(entry.Entry, "Assign-Reduce-%d-Worker-%d", &taskID, &workerID)
+							shared.ReduceTasks[taskID] = 1
+							shared.TaskTimestamps[fmt.Sprintf("reduce-%d", taskID)] = time.Now()
+						} else if strings.HasPrefix(entry.Entry, "Complete-Reduce-") {
+							fmt.Sscanf(entry.Entry, "Complete-Reduce-%d", &taskID)
+							shared.ReduceTasks[taskID] = 2
+							delete(shared.TaskTimestamps, fmt.Sprintf("reduce-%d", taskID))
+						}
+					}
+				}
+			}
+
+			// 5. Send back a success confirmation to the leader!
+			successReply := shared.RAFTRequest{
+				To:           req.From, // Target back to the leader node
+				From:         id,
+				Term:         node.Term,
+				Type:         3,        // Replication Confirmation Type
+				Success:      true,
+				PrevLogIndex: req.PrevLogIndex + len(req.Entries),
+			}
+			var b bool
+			server.Call("RAFTRequests.Add", successReply, &b)
+			
+			shared.MRMutex.Unlock()
 		case 3: //follower replication confirmation
 			if node.State != 2 {
 				continue //dont care if Im not the leader
@@ -334,9 +443,16 @@ func runRAFTHB(server *rpc.Client, node *shared.RAFTNode, membership **shared.Me
 	// Broadcast leader ping to all nodes if leader
 	if node.State == 2 {
 		var masterServerLog []shared.LogEntry
-		err := server.Call("Coordinator.GetLog", id, &masterServerLog)
+		err := server.Call("Coordinator.GetLog", node.CommitIndex, &masterServerLog)
 		if err == nil {
 			node.Log = masterServerLog //make our log the most recent master log
+
+			//correction for term zero -> current term
+			for idx := range node.Log {
+				if node.Log[idx].Term == 0 {
+					node.Log[idx].Term = node.Term
+				}
+			}
 		}
 
 		//compute log slices for each follower
