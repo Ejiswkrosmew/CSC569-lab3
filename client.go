@@ -2,17 +2,17 @@ package main
 
 import (
 	"fmt"
-	"lab3/shared"
 	"io/ioutil"
-	"sort"
+	"lab3/shared"
 	"math/rand"
 	"net/rpc"
 	"os"
+	"sort"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 	"unicode"
-	"strings"
-	"strconv"
 )
 
 const (
@@ -29,14 +29,12 @@ const (
 	RAFT_HB       = 50  // ms
 )
 
-
 var isWorking = false
 
 var start time.Time = time.Now()
 var self_node shared.Node
 var self_RAFT_node *shared.RAFTNode //need to make this a pointer so we can pass it around
 var election_timeout *time.Timer
-
 
 func broadcastRAFT(server *rpc.Client, req shared.RAFTRequest, membership *shared.Membership) {
 	for _, receiver := range (*membership).Keys() {
@@ -122,11 +120,11 @@ func main() {
 	// Construct self
 	self_node = shared.Node{ID: id, Hbcounter: 0, Time: currTime, Alive: true}
 	self_RAFT_node = &shared.RAFTNode{
-		State: 0,
-		Term: 0,
-		Vote: 0,
-		Votes: 0,
-		Log: []shared.LogEntry{},
+		State:       0,
+		Term:        0,
+		Vote:        0,
+		Votes:       0,
+		Log:         []shared.LogEntry{},
 		CommitIndex: -1,
 		LastApplied: -1,
 	}
@@ -135,7 +133,7 @@ func main() {
 	shared.ReduceTasks = make([]int, shared.NReduce)
 	shared.TaskTimestamps = make(map[string]time.Time)
 	shared.MRMutex.Unlock()
-	
+
 	var self_node_response shared.Node // Allocate space for a response to overwrite this
 
 	// Add node with input ID
@@ -178,8 +176,8 @@ func runElectionLoop(server *rpc.Client, node *shared.RAFTNode, membership **sha
 	}
 
 	// Schedule the next potential election timeout window safely
-	*election_timeout = time.AfterFunc(time.Millisecond*time.Duration(rand.Float32()*(CAND_TIME_MAX-CAND_TIME_MIN)+CAND_TIME_MIN), func() { 
-		runElectionLoop(server, node, membership, id, election_timeout) 
+	*election_timeout = time.AfterFunc(time.Millisecond*time.Duration(rand.Float32()*(CAND_TIME_MAX-CAND_TIME_MIN)+CAND_TIME_MIN), func() {
+		runElectionLoop(server, node, membership, id, election_timeout)
 	})
 
 	// New term increment
@@ -187,8 +185,8 @@ func runElectionLoop(server *rpc.Client, node *shared.RAFTNode, membership **sha
 
 	// Now a candidate
 	node.State = 1
-	node.Vote = id     //A candidate always votes for itself first!
-	node.Votes = 1     //Start with 1 vote (your own)
+	node.Vote = id //A candidate always votes for itself first!
+	node.Votes = 1 //Start with 1 vote (your own)
 
 	// Broadcast vote request
 	req := shared.RAFTRequest{
@@ -263,7 +261,7 @@ func runRAFTHB(server *rpc.Client, node *shared.RAFTNode, membership **shared.Me
 				var b bool
 				server.Call("RAFTRequests.Add", rejectOld, &b)
 				shared.MRMutex.Unlock()
-				continue 
+				continue
 			}
 
 			node.State = 0
@@ -288,10 +286,7 @@ func runRAFTHB(server *rpc.Client, node *shared.RAFTNode, membership **shared.Me
 					currentIdx := insertIndex + i
 
 					//isolate the entry
-					safeEntry := shared.LogEntry{
-						Entry: entry.Entry,
-						Term:  entry.Term,
-					}
+					safeEntry := *entry.Copy()
 
 					if currentIdx < len(node.Log) {
 						if node.Log[currentIdx].Term != safeEntry.Term {
@@ -312,7 +307,7 @@ func runRAFTHB(server *rpc.Client, node *shared.RAFTNode, membership **shared.Me
 				if targetCommit > len(node.Log)-1 {
 					targetCommit = len(node.Log) - 1
 				}
-				
+
 				if targetCommit > node.CommitIndex {
 					node.CommitIndex = targetCommit
 					fmt.Printf("NODE %d: Advanced CommitIndex to %d\n", id, node.CommitIndex)
@@ -320,33 +315,54 @@ func runRAFTHB(server *rpc.Client, node *shared.RAFTNode, membership **shared.Me
 					// Rebuild local operational states from verified logs
 					for node.LastApplied < node.CommitIndex {
 						nextApp := node.LastApplied + 1
-						
+
 						if nextApp >= len(node.Log) || nextApp < 0 || len(node.Log) == 0 {
-							break 
+							break
 						}
-						
+
 						node.LastApplied = nextApp
 						entry := node.Log[node.LastApplied]
-						
-						var taskID, workerID int
-						// Match against your field named "Entry"
-						if strings.HasPrefix(entry.Entry, "Assign-Map-") {
-							fmt.Sscanf(entry.Entry, "Assign-Map-%d-Worker-%d", &taskID, &workerID)
-							shared.MapTasks[taskID] = 1
-							shared.TaskTimestamps[fmt.Sprintf("map-%d", taskID)] = time.Now()
-						} else if strings.HasPrefix(entry.Entry, "Complete-Map-") {
-							fmt.Sscanf(entry.Entry, "Complete-Map-%d", &taskID)
-							shared.MapTasks[taskID] = 2
-							delete(shared.TaskTimestamps, fmt.Sprintf("map-%d", taskID))
-						} else if strings.HasPrefix(entry.Entry, "Assign-Reduce-") {
-							fmt.Sscanf(entry.Entry, "Assign-Reduce-%d-Worker-%d", &taskID, &workerID)
-							shared.ReduceTasks[taskID] = 1
-							shared.TaskTimestamps[fmt.Sprintf("reduce-%d", taskID)] = time.Now()
-						} else if strings.HasPrefix(entry.Entry, "Complete-Reduce-") {
-							fmt.Sscanf(entry.Entry, "Complete-Reduce-%d", &taskID)
-							shared.ReduceTasks[taskID] = 2
-							delete(shared.TaskTimestamps, fmt.Sprintf("reduce-%d", taskID))
+						taskId := entry.ID
+						// workerID := entry.WorkerID
+
+						if entry.Type == 0 {
+							// Map type
+							if entry.Status == 0 && shared.MapTasks[taskId] == 0 {
+								// Assign (Only if idle)
+								shared.MapTasks[taskId] = 1
+							} else if entry.Status == 1 {
+								//Completed
+								shared.MapTasks[taskId] = 2
+							}
+						} else if entry.Type == 1 {
+							// Reduce type
+							if entry.Status == 0 && shared.ReduceTasks[taskId] == 0 {
+								// Assign (Only if idle)
+								shared.ReduceTasks[taskId] = 1
+							} else if entry.Status == 1 {
+								//Completed
+								shared.ReduceTasks[taskId] = 2
+							}
 						}
+						// var taskID, workerID int
+						// // Match against your field named "Entry"
+						// if strings.HasPrefix(entry.Entry, "Assign-Map-") {
+						// 	fmt.Sscanf(entry.Entry, "Assign-Map-%d-Worker-%d", &taskID, &workerID)
+						// 	shared.MapTasks[taskID] = 1
+						// 	shared.TaskTimestamps[fmt.Sprintf("map-%d", taskID)] = time.Now()
+						// } else if strings.HasPrefix(entry.Entry, "Complete-Map-") {
+						// 	fmt.Sscanf(entry.Entry, "Complete-Map-%d", &taskID)
+						// 	shared.MapTasks[taskID] = 2
+						// 	delete(shared.TaskTimestamps, fmt.Sprintf("map-%d", taskID))
+						// } else if strings.HasPrefix(entry.Entry, "Assign-Reduce-") {
+						// 	fmt.Sscanf(entry.Entry, "Assign-Reduce-%d-Worker-%d", &taskID, &workerID)
+						// 	shared.ReduceTasks[taskID] = 1
+						// 	shared.TaskTimestamps[fmt.Sprintf("reduce-%d", taskID)] = time.Now()
+						// } else if strings.HasPrefix(entry.Entry, "Complete-Reduce-") {
+						// 	fmt.Sscanf(entry.Entry, "Complete-Reduce-%d", &taskID)
+						// 	shared.ReduceTasks[taskID] = 2
+						// 	delete(shared.TaskTimestamps, fmt.Sprintf("reduce-%d", taskID))
+						// }
 					}
 				}
 			}
@@ -356,13 +372,13 @@ func runRAFTHB(server *rpc.Client, node *shared.RAFTNode, membership **shared.Me
 				To:           req.From, // Target back to the leader node
 				From:         id,
 				Term:         node.Term,
-				Type:         3,        // Replication Confirmation Type
+				Type:         3, // Replication Confirmation Type
 				Success:      true,
 				PrevLogIndex: req.PrevLogIndex + len(req.Entries),
 			}
 			var b bool
 			server.Call("RAFTRequests.Add", successReply, &b)
-			
+
 			shared.MRMutex.Unlock()
 		case 3: //follower replication confirmation
 			if node.State != 2 {
@@ -381,7 +397,7 @@ func runRAFTHB(server *rpc.Client, node *shared.RAFTNode, membership **shared.Me
 								count++ //cont it if its not us and it is caught up to here
 							}
 						}
-						
+
 						// If a  majority of the cluster confirmed it, commit it!
 						if count >= (*membership).Len()/2+1 {
 							node.CommitIndex = N
@@ -528,7 +544,7 @@ func runAfterZ(server *rpc.Client, id int) {
 	os.Exit(1)
 }
 
-//actual map and reduce funcs
+// actual map and reduce funcs
 func Map(filename string, contents string) []KeyValue {
 	// Function to detect word separators (returns true if the character is NOT a letter)
 	ff := func(r rune) bool { return !unicode.IsLetter(r) }
@@ -550,7 +566,7 @@ func Reduce(key string, values []string) string {
 	return strconv.Itoa(len(values))
 }
 
-//assign buckets
+// assign buckets
 func getBucket(word string, nReduce int) int {
 	sum := 0
 	for _, r := range word {
@@ -649,13 +665,13 @@ func executeSimpleReduce(taskID int, nMap int, server *rpc.Client) {
 		for j < len(intermediate) && intermediate[j].Key == intermediate[i].Key {
 			j++
 		}
-		
+
 		// Collect all the value strings (which will just be strings of "1")
 		values := []string{}
 		for k := i; k < j; k++ {
 			values = append(values, intermediate[k].Value)
 		}
-		
+
 		// Execute the Reduce function to count the size of the value slice
 		output := Reduce(intermediate[i].Key, values)
 
@@ -681,10 +697,9 @@ type KeyValue struct {
 
 type ByKey []KeyValue
 
-func (a ByKey) Len() int          { return len(a) } 
+func (a ByKey) Len() int           { return len(a) }
 func (a ByKey) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
 func (a ByKey) Less(i, j int) bool { return a[i].Key < a[j].Key }
-
 
 func runWorkerExecutionLoop(server *rpc.Client, id int) {
 	// Re-queue this function to evaluate every 500ms
@@ -693,11 +708,11 @@ func runWorkerExecutionLoop(server *rpc.Client, id int) {
 	// Only request tasks if I am a healthy follower, I know who the leader is, and I am not busy
 	if self_RAFT_node.State == 0 && self_RAFT_node.Leader != 0 && !isWorking {
 		isWorking = true
-		
+
 		go func() {
 			var reply shared.TaskReply
 			args := shared.TaskRequest{WorkerID: id}
-			
+
 			err := server.Call("Coordinator.GiveOutTask", &args, &reply)
 			if err == nil {
 				switch reply.TaskType {

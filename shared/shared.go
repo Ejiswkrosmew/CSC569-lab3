@@ -6,7 +6,6 @@ import (
 	"math/rand"
 	"sync"
 	"time"
-	"strings"
 )
 
 const (
@@ -16,8 +15,21 @@ const (
 //-- map reduce stuff
 
 type LogEntry struct {
-	Entry string // "Assignmap-0-worker2"
-	Term int //election term
+	Type     int // 0 = Map, 1 = Reduce
+	Status   int // 0 = Assign, 1 = Complete
+	ID       int // MapID/Key
+	WorkerID int
+	Term     int //election term
+}
+
+func (e LogEntry) Copy() *LogEntry {
+	return &LogEntry{
+		Type:     e.Type,
+		Status:   e.Status,
+		ID:       e.ID,
+		WorkerID: e.WorkerID,
+		Term:     e.Term,
+	}
 }
 
 var InputFiles = []string{"pg-being_ernest.txt", "pg-metamorphosis.txt"}
@@ -30,7 +42,7 @@ var TaskTimestamps map[string]time.Time
 
 var MRMutex sync.Mutex
 
-type Coordinator struct{
+type Coordinator struct {
 	Log []LogEntry //centralized log
 } //for registering to server
 
@@ -39,11 +51,11 @@ type TaskRequest struct {
 }
 
 type TaskReply struct {
-	TaskType int    // 0 = Wait, 1 = Map, 2 = Reduce, 3 = All Done
-	TaskID   int    
+	TaskType int // 0 = Wait, 1 = Map, 2 = Reduce, 3 = All Done
+	TaskID   int
 	Filename string
-	NReduce  int   
-	NMap     int   
+	NReduce  int
+	NMap     int
 }
 
 type CompleteTaskArgs struct {
@@ -51,18 +63,17 @@ type CompleteTaskArgs struct {
 	TaskID   int
 }
 
-
 type RAFTNode struct {
-	State  int // 0: follower, 1: candidate, 2: leader
-	Term   int
-	Vote   int
-	Votes  int
-	Leader int
-	Log []LogEntry //log
-	CommitIndex int //index of highest entry committed
-	LastApplied int //index of highest entry applied to state machine
+	State       int // 0: follower, 1: candidate, 2: leader
+	Term        int
+	Vote        int
+	Votes       int
+	Leader      int
+	Log         []LogEntry //log
+	CommitIndex int        //index of highest entry committed
+	LastApplied int        //index of highest entry applied to state machine
 	//for the leader
-	NextIndex map[int]int //next entry to send to each peer
+	NextIndex  map[int]int //next entry to send to each peer
 	MatchIndex map[int]int //highest mirrored per peer
 }
 
@@ -87,7 +98,7 @@ func (n Node) CrashTime() int {
 func (n Node) InitializeNeighbors(id int) [2]int {
 	// If you are running exactly nodes 1, 2, 3, and 4:
 	// We want a ring: 1 -> 2 -> 3 -> 4 -> 1
-	
+
 	// Find neighbor ahead
 	next := id + 1
 	if next > 4 {
@@ -227,15 +238,15 @@ func (m *Membership) Print() {
 /*---------------*/
 
 type RAFTRequest struct {
-	To   int
-	From int
-	Term int
-	Type int // 0: request, 1: vote, 2: leader-ping
-	PrevLogIndex int //index of entry just before new ones
-	PrevLogTerm int //term of above
-	Entries []LogEntry //logs to store
-	LeaderCommit int //leaders commit index
-	Success bool //follower replication status reply
+	To           int
+	From         int
+	Term         int
+	Type         int        // 0: request, 1: vote, 2: leader-ping
+	PrevLogIndex int        //index of entry just before new ones
+	PrevLogTerm  int        //term of above
+	Entries      []LogEntry //logs to store
+	LeaderCommit int        //leaders commit index
+	Success      bool       //follower replication status reply
 }
 
 type RAFTRequests struct {
@@ -398,8 +409,11 @@ func (c *Coordinator) GiveOutTask(args *TaskRequest, reply *TaskReply) error {
 			//instead of just changing state we have
 			//to do the log stuff
 			c.Log = append(c.Log, LogEntry{
-				Entry: fmt.Sprintf("Assign-Map-%d-Worker-%d", i, args.WorkerID),
-				Term: 0, //will be updated later by leader
+				Type:     0,
+				Status:   0,
+				ID:       i,
+				WorkerID: args.WorkerID,
+				Term:     0, //will be updated later by leader
 			})
 
 			reply.TaskType = 1
@@ -425,8 +439,11 @@ func (c *Coordinator) GiveOutTask(args *TaskRequest, reply *TaskReply) error {
 	for i, status := range ReduceTasks {
 		if status == 0 { // Idle
 			c.Log = append(c.Log, LogEntry{
-				Entry: fmt.Sprintf("Assign-Reduce-%d-Worker-%d", i, args.WorkerID),
-				Term:    0,
+				Type:     1,
+				Status:   0,
+				ID:       i,
+				WorkerID: args.WorkerID,
+				Term:     0,
 			})
 
 			reply.TaskType = 2
@@ -450,15 +467,19 @@ func (c *Coordinator) CompleteTask(args *CompleteTaskArgs, reply *bool) error {
 	//rmark map done
 	if args.TaskType == 1 {
 		c.Log = append(c.Log, LogEntry{
-			Entry: fmt.Sprintf("Complete-Map-%d", args.TaskID),
-			Term:    0,
+			Type:   0,
+			Status: 1,
+			ID:     args.TaskID,
+			Term:   0,
 		})
 		fmt.Printf("Leader State Machine: Logged completion intent for Map Task %d\n", args.TaskID)
-	//mark reduce done
+		//mark reduce done
 	} else if args.TaskType == 2 {
 		c.Log = append(c.Log, LogEntry{
-			Entry: fmt.Sprintf("Complete-Reduce-%d", args.TaskID),
-			Term:    0,
+			Type:   1,
+			Status: 1,
+			ID:     args.TaskID,
+			Term:   0,
 		})
 		fmt.Printf("Leader State Machine: Logged completion intent for Reduce Task %d\n", args.TaskID)
 	}
@@ -471,7 +492,7 @@ func (c *Coordinator) CompleteTask(args *CompleteTaskArgs, reply *bool) error {
 func (c *Coordinator) GetLog(leaderCommit int, reply *[]LogEntry) error {
 	MRMutex.Lock()
 	defer MRMutex.Unlock()
-	
+
 	// Create a deep slice copy to prevent concurrent thread manipulation race conditions
 	*reply = append([]LogEntry{}, c.Log...)
 
@@ -479,28 +500,48 @@ func (c *Coordinator) GetLog(leaderCommit int, reply *[]LogEntry) error {
 	if leaderCommit >= 0 && leaderCommit < len(c.Log) {
 		for i := 0; i <= leaderCommit; i++ {
 			entry := c.Log[i]
-			var taskID, workerID int
-			
-			if strings.HasPrefix(entry.Entry, "Assign-Map-") {
-				fmt.Sscanf(entry.Entry, "Assign-Map-%d-Worker-%d", &taskID, &workerID)
-				if MapTasks[taskID] == 0 { // Only advance if it's currently idle
-					MapTasks[taskID] = 1 // Mark In Progress
+			taskId := entry.ID
+			// workerID := entry.WorkerID
+
+			if entry.Type == 0 {
+				// Map type
+				if entry.Status == 0 && MapTasks[taskId] == 0 {
+					// Assign (Only if idle)
+					MapTasks[taskId] = 1
+				} else if entry.Status == 1 {
+					//Completed
+					MapTasks[taskId] = 2
 				}
-			} else if strings.HasPrefix(entry.Entry, "Complete-Map-") {
-				fmt.Sscanf(entry.Entry, "Complete-Map-%d", &taskID)
-				MapTasks[taskID] = 2 // Mark Completed
-			} else if strings.HasPrefix(entry.Entry, "Assign-Reduce-") {
-				fmt.Sscanf(entry.Entry, "Assign-Reduce-%d-Worker-%d", &taskID, &workerID)
-				if ReduceTasks[taskID] == 0 {
-					ReduceTasks[taskID] = 1 // Mark In Progress
+			} else if entry.Type == 1 {
+				// Reduce type
+				if entry.Status == 0 && ReduceTasks[taskId] == 0 {
+					// Assign (Only if idle)
+					ReduceTasks[taskId] = 1
+				} else if entry.Status == 1 {
+					//Completed
+					ReduceTasks[taskId] = 2
 				}
-			} else if strings.HasPrefix(entry.Entry, "Complete-Reduce-") {
-				fmt.Sscanf(entry.Entry, "Complete-Reduce-%d", &taskID)
-				ReduceTasks[taskID] = 2 // Mark Completed
 			}
+
+			// if strings.HasPrefix(entry.Entry, "Assign-Map-") {
+			// 	fmt.Sscanf(entry.Entry, "Assign-Map-%d-Worker-%d", &taskID, &workerID)
+			// 	if MapTasks[taskID] == 0 { // Only advance if it's currently idle
+			// 		MapTasks[taskID] = 1 // Mark In Progress
+			// 	}
+			// } else if strings.HasPrefix(entry.Entry, "Complete-Map-") {
+			// 	fmt.Sscanf(entry.Entry, "Complete-Map-%d", &taskID)
+			// 	MapTasks[taskID] = 2 // Mark Completed
+			// } else if strings.HasPrefix(entry.Entry, "Assign-Reduce-") {
+			// 	fmt.Sscanf(entry.Entry, "Assign-Reduce-%d-Worker-%d", &taskID, &workerID)
+			// 	if ReduceTasks[taskID] == 0 {
+			// 		ReduceTasks[taskID] = 1 // Mark In Progress
+			// 	}
+			// } else if strings.HasPrefix(entry.Entry, "Complete-Reduce-") {
+			// 	fmt.Sscanf(entry.Entry, "Complete-Reduce-%d", &taskID)
+			// 	ReduceTasks[taskID] = 2 // Mark Completed
+			// }
 		}
 	}
 
 	return nil
 }
-
