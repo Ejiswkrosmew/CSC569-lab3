@@ -12,7 +12,24 @@ const (
 	MAX_NODES = 4
 )
 
+// Intermediate data structure
+type KeyValue struct {
+	Key   string
+	Value string
+}
+
+type ByKey []KeyValue
+
+func (a ByKey) Len() int           { return len(a) }
+func (a ByKey) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
+func (a ByKey) Less(i, j int) bool { return a[i].Key < a[j].Key }
+
 //-- map reduce stuff
+
+type IntFile struct {
+	WorkerID  int
+	Partition int
+}
 
 type LogEntry struct {
 	Type     int // 0 = Map, 1 = Reduce
@@ -38,6 +55,7 @@ var NReduce = 3
 // Task tracking: 0 = Idle, 1 = In Progress, 2 = Completed
 var MapTasks []int
 var ReduceTasks []int
+var ReduceFiles [][]IntFile
 var TaskTimestamps map[string]time.Time
 
 var MRMutex sync.Mutex
@@ -61,6 +79,7 @@ type TaskReply struct {
 type CompleteTaskArgs struct {
 	TaskType int // 1 = Map, 2 = Reduce
 	TaskID   int
+	NewFiles []IntFile
 }
 
 type RAFTNode struct {
@@ -466,6 +485,23 @@ func (c *Coordinator) CompleteTask(args *CompleteTaskArgs, reply *bool) error {
 
 	//rmark map done
 	if args.TaskType == 1 {
+		for b, newFile := range args.NewFiles {
+			fmt.Printf("Adding to task %d: %v\n", b, newFile)
+			files := ReduceFiles[b]
+
+			exists := false
+			for _, f := range files {
+				if f == newFile {
+					exists = true
+					break
+				}
+			}
+
+			if !exists {
+				ReduceFiles[b] = append(files, newFile)
+			}
+		}
+
 		c.Log = append(c.Log, LogEntry{
 			Type:   0,
 			Status: 1,
@@ -522,24 +558,6 @@ func (c *Coordinator) GetLog(leaderCommit int, reply *[]LogEntry) error {
 					ReduceTasks[taskId] = 2
 				}
 			}
-
-			// if strings.HasPrefix(entry.Entry, "Assign-Map-") {
-			// 	fmt.Sscanf(entry.Entry, "Assign-Map-%d-Worker-%d", &taskID, &workerID)
-			// 	if MapTasks[taskID] == 0 { // Only advance if it's currently idle
-			// 		MapTasks[taskID] = 1 // Mark In Progress
-			// 	}
-			// } else if strings.HasPrefix(entry.Entry, "Complete-Map-") {
-			// 	fmt.Sscanf(entry.Entry, "Complete-Map-%d", &taskID)
-			// 	MapTasks[taskID] = 2 // Mark Completed
-			// } else if strings.HasPrefix(entry.Entry, "Assign-Reduce-") {
-			// 	fmt.Sscanf(entry.Entry, "Assign-Reduce-%d-Worker-%d", &taskID, &workerID)
-			// 	if ReduceTasks[taskID] == 0 {
-			// 		ReduceTasks[taskID] = 1 // Mark In Progress
-			// 	}
-			// } else if strings.HasPrefix(entry.Entry, "Complete-Reduce-") {
-			// 	fmt.Sscanf(entry.Entry, "Complete-Reduce-%d", &taskID)
-			// 	ReduceTasks[taskID] = 2 // Mark Completed
-			// }
 		}
 	}
 

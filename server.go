@@ -18,6 +18,7 @@ func main() {
 	shared.MRMutex.Lock()
 	shared.MapTasks = make([]int, len(shared.InputFiles))
 	shared.ReduceTasks = make([]int, shared.NReduce)
+	shared.ReduceFiles = make([][]shared.IntFile, shared.NReduce)
 	shared.TaskTimestamps = make(map[string]time.Time)
 	shared.MRMutex.Unlock()
 

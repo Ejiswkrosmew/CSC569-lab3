@@ -131,6 +131,7 @@ func main() {
 	shared.MRMutex.Lock()
 	shared.MapTasks = make([]int, len(shared.InputFiles))
 	shared.ReduceTasks = make([]int, shared.NReduce)
+	shared.ReduceFiles = make([][]shared.IntFile, shared.NReduce)
 	shared.TaskTimestamps = make(map[string]time.Time)
 	shared.MRMutex.Unlock()
 
@@ -545,17 +546,17 @@ func runAfterZ(server *rpc.Client, id int) {
 }
 
 // actual map and reduce funcs
-func Map(filename string, contents string) []KeyValue {
+func Map(filename string, contents string) []shared.KeyValue {
 	// Function to detect word separators (returns true if the character is NOT a letter)
 	ff := func(r rune) bool { return !unicode.IsLetter(r) }
 
 	// Split contents into an array of clean words based on our separator function
 	words := strings.FieldsFunc(contents, ff)
 
-	kva := []KeyValue{}
+	kva := []shared.KeyValue{}
 	for _, w := range words {
 		// Create a key-value pair for each word found
-		kv := KeyValue{Key: w, Value: "1"}
+		kv := shared.KeyValue{Key: w, Value: "1"}
 		kva = append(kva, kv)
 	}
 	return kva
@@ -575,7 +576,7 @@ func getBucket(word string, nReduce int) int {
 	return sum % nReduce
 }
 
-func executeSimpleMap(taskID int, filename string, nReduce int, server *rpc.Client) {
+func executeSimpleMap(taskID int, id int, filename string, nReduce int, server *rpc.Client) {
 	// 1. Open and read the raw content of the input file
 	file, err := os.Open(filename)
 	if err != nil {
@@ -592,17 +593,20 @@ func executeSimpleMap(taskID int, filename string, nReduce int, server *rpc.Clie
 
 	// 2. Process contents into a slice of individual words paired with "1"
 	kva := Map(filename, string(content))
+	newFiles := make([]shared.IntFile, nReduce)
 
 	// 3. Open file handles for each of our destination partition buckets
 	files := make([]*os.File, nReduce)
 	for b := 0; b < nReduce; b++ {
-		outName := fmt.Sprintf("mr-%d-%d", taskID, b)
+		outName := fmt.Sprintf("mr-%d-%d", id, b)
 		f, err := os.Create(outName)
 		if err != nil {
 			fmt.Printf("Worker Error: Cannot create partition file %s\n", outName)
 			return
 		}
 		files[b] = f
+		newFiles[b] = shared.IntFile{WorkerID: id, Partition: b}
+		fmt.Printf("New file for %d: %v\n", b, outName)
 	}
 
 	// 4. Distribute each KeyValue pair into its calculated bucket file
@@ -619,16 +623,16 @@ func executeSimpleMap(taskID int, filename string, nReduce int, server *rpc.Clie
 
 	// 5. Notify the RAFT Leader that this Map task successfully completed
 	var reply bool
-	args := shared.CompleteTaskArgs{TaskType: 1, TaskID: taskID}
+	args := shared.CompleteTaskArgs{TaskType: 1, TaskID: taskID, NewFiles: newFiles}
 	server.Call("Coordinator.CompleteTask", &args, &reply)
 }
 
 func executeSimpleReduce(taskID int, nMap int, server *rpc.Client) {
-	intermediate := []KeyValue{}
+	intermediate := []shared.KeyValue{}
 
 	// 1. Collect intermediate files from all Map tasks for this bucket partition ID
-	for m := 0; m < nMap; m++ {
-		inName := fmt.Sprintf("mr-%d-%d", m, taskID)
+	for _, intFile := range shared.ReduceFiles[taskID] {
+		inName := fmt.Sprintf("mr-%d-%d", intFile.WorkerID, intFile.Partition)
 		file, err := os.Open(inName)
 		if err != nil {
 			continue // Safe to skip if a Map task didn't produce keys for this specific bucket
@@ -641,13 +645,13 @@ func executeSimpleReduce(taskID int, nMap int, server *rpc.Client) {
 			if err != nil {
 				break // Hit EOF, break out to stop reading this specific file
 			}
-			intermediate = append(intermediate, KeyValue{Key: key, Value: val})
+			intermediate = append(intermediate, shared.KeyValue{Key: key, Value: val})
 		}
 		file.Close()
 	}
 
 	// 2. Sort the collected slice so identical words are forced into adjacent positions
-	sort.Sort(ByKey(intermediate))
+	sort.Sort(shared.ByKey(intermediate))
 
 	// 3. Open the final aggregated word count file
 	outName := fmt.Sprintf("mr-out-%d", taskID)
@@ -689,18 +693,6 @@ func executeSimpleReduce(taskID int, nMap int, server *rpc.Client) {
 	server.Call("Coordinator.CompleteTask", &args, &reply)
 }
 
-// Intermediate data structure
-type KeyValue struct {
-	Key   string
-	Value string
-}
-
-type ByKey []KeyValue
-
-func (a ByKey) Len() int           { return len(a) }
-func (a ByKey) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
-func (a ByKey) Less(i, j int) bool { return a[i].Key < a[j].Key }
-
 func runWorkerExecutionLoop(server *rpc.Client, id int) {
 	// Re-queue this function to evaluate every 500ms
 	time.AfterFunc(500*time.Millisecond, func() { runWorkerExecutionLoop(server, id) })
@@ -718,7 +710,7 @@ func runWorkerExecutionLoop(server *rpc.Client, id int) {
 				switch reply.TaskType {
 				case 1: // Map Task
 					fmt.Printf("NODE %d: Received Map Task %d (%s)\n", id, reply.TaskID, reply.Filename)
-					executeSimpleMap(reply.TaskID, reply.Filename, reply.NReduce, server)
+					executeSimpleMap(reply.TaskID, id, reply.Filename, reply.NReduce, server)
 					isWorking = false // Task finished, reset flag
 				case 2: // Reduce Task
 					fmt.Printf("NODE %d: Received Reduce Task %d\n", id, reply.TaskID)
