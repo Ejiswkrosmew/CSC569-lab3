@@ -16,6 +16,8 @@ func main() {
 
 	//init mr stuff
 	shared.MRMutex.Lock()
+	//TODO: -1 is idle, 0 is done, all other ints are node id assigned
+	//IMPLEMENT
 	shared.MapTasks = make([]int, len(shared.InputFiles))
 	shared.ReduceTasks = make([]int, shared.NReduce)
 	shared.TaskTimestamps = make(map[string]time.Time)

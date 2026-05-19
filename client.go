@@ -34,7 +34,7 @@ var isWorking = false
 
 var start time.Time = time.Now()
 var self_node shared.Node
-var self_RAFT_node shared.RAFTNode
+var self_RAFT_node *shared.RAFTNode
 var election_timeout *time.Timer
 
 
@@ -43,12 +43,11 @@ func broadcastRAFT(server *rpc.Client, req shared.RAFTRequest, membership *share
 		if receiver == req.From {
 			continue
 		}
-		newReq := shared.RAFTRequest{
-			To:   receiver,
-			From: req.From,
-			Term: req.Term,
-			Type: req.Type,
-		}
+		
+		// FIXED: Clone the actual request properties so logs are preserved
+		newReq := req
+		newReq.To = receiver
+
 		var reply bool
 		go server.Call("RAFTRequests.Add", newReq, &reply)
 	}
@@ -125,7 +124,7 @@ func main() {
 	currTime := calcTime()
 	// Construct self
 	self_node = shared.Node{ID: id, Hbcounter: 0, Time: currTime, Alive: true}
-	self_RAFT_node = shared.RAFTNode{State: 0, Term: 0, Vote: 0, Votes: 0}
+	self_RAFT_node = &shared.RAFTNode{State: 0, Term: 0, Vote: 0, Votes: 0, Log: []shared.LogEntry{}}
 	var self_node_response shared.Node // Allocate space for a response to overwrite this
 
 	// Add node with input ID
@@ -151,8 +150,8 @@ func main() {
 
 	// Delaying the election until the membership table is probably filled
 	fmt.Printf("Waiting %d seconds for the membership list to fill out...\n", RAFT_DELAY)
-	election_timeout = time.AfterFunc(time.Second*RAFT_DELAY+time.Millisecond*time.Duration(rand.Float32()*(CAND_TIME_MAX-CAND_TIME_MIN)+CAND_TIME_MIN), func() { runElectionLoop(server, &self_RAFT_node, &membership, id, &election_timeout) })
-	time.AfterFunc(time.Millisecond*RAFT_HB, func() { runRAFTHB(server, &self_RAFT_node, &membership, id, &election_timeout) })
+	election_timeout = time.AfterFunc(time.Second*RAFT_DELAY+time.Millisecond*time.Duration(rand.Float32()*(CAND_TIME_MAX-CAND_TIME_MIN)+CAND_TIME_MIN), func() { runElectionLoop(server, self_RAFT_node, &membership, id, &election_timeout) })
+	time.AfterFunc(time.Millisecond*RAFT_HB, func() { runRAFTHB(server, self_RAFT_node, &membership, id, &election_timeout) })
 
 	//dedicated worker loop
 	time.AfterFunc(time.Second*RAFT_DELAY, func() { runWorkerExecutionLoop(server, id) })
@@ -242,24 +241,178 @@ func runRAFTHB(server *rpc.Client, node *shared.RAFTNode, membership **shared.Me
 			// Vote received
 			node.Votes++
 			fmt.Printf("NODE %d (%.2fs): Received a vote from %d (votes: %d/%d)\n", id, time.Since(start).Seconds(), req.From, node.Votes, (*membership).Len())
-		case 2: // Leader Ping
-			if node.Leader != req.From {
-				fmt.Printf("NODE %d (%.2fs): Leader %d acknowledged\n", id, time.Since(start).Seconds(), req.From)
+		case 2: // AppendEntries / Leader Ping
+			// Secure the state machine arrays and local log memory from concurrent thread race conditions
+			shared.MRMutex.Lock()
+
+			// 1. Reply false if term is older than ours
+			if req.Term < node.Term {
+				rejectOld := shared.RAFTRequest{
+					To:           req.From,
+					From:         id,
+					Term:         node.Term,
+					Type:         3,
+					Success:      false,
+					PrevLogIndex: -1,
+				}
+				var b bool
+				server.Call("RAFTRequests.Add", rejectOld, &b)
+				shared.MRMutex.Unlock()
+				continue 
 			}
 
+			// Clean tracking state update: step down to follower
 			node.State = 0
 			node.Leader = req.From
-
 			(*election_timeout).Reset(time.Millisecond * time.Duration(rand.Float32()*(CAND_TIME_MAX-CAND_TIME_MIN)+CAND_TIME_MIN))
+
+			// 2. Validate log consistency matching leader's history
+			if req.PrevLogIndex >= 0 && (req.PrevLogIndex >= len(node.Log) || node.Log[req.PrevLogIndex].Term != req.PrevLogTerm) {
+				rejectReply := shared.RAFTRequest{
+					To:           req.From,
+					From:         id,
+					Term:         node.Term,
+					Type:         3,
+					Success:      false,
+					PrevLogIndex: req.PrevLogIndex,
+				}
+				var b bool
+				server.Call("RAFTRequests.Add", rejectReply, &b)
+				shared.MRMutex.Unlock()
+				continue
+			}
+
+			// 3. Append any new entries safely by identifying and overwriting conflicts
+			insertIndex := req.PrevLogIndex + 1
+			if len(req.Entries) > 0 {
+				for i, entry := range req.Entries {
+					currentIdx := insertIndex + i
+					if currentIdx < len(node.Log) {
+						if node.Log[currentIdx].Term != entry.Term {
+							// Term conflict found! Truncate old mismatched log branch
+							node.Log = node.Log[:currentIdx]
+							node.Log = append(node.Log, entry)
+						}
+						// If terms match perfectly, it's a safe duplicate we already possess
+					} else {
+						// Surpassed local log array dimensions; safe to dump everything left over
+						node.Log = append(node.Log, req.Entries[i:]...)
+						break
+					}
+				}
+				fmt.Printf("NODE %d: Log Updated. Total Log Size: %d\n", id, len(node.Log))
+			}
+
+			// 4. Update commit index tracking boundaries safely
+			if req.LeaderCommit > node.CommitIndex {
+				// Cap target commit strictly to what we have locally in memory
+				targetCommit := req.LeaderCommit
+				if targetCommit > len(node.Log)-1 {
+					targetCommit = len(node.Log) - 1
+				}
+				
+				if targetCommit > node.CommitIndex {
+					node.CommitIndex = targetCommit
+					fmt.Printf("NODE %d: Updated CommitIndex to %d (Log Size: %d)\n", id, node.CommitIndex, len(node.Log))
+
+					// Apply newly committed entries directly onto active MapReduce runtime tracking slices
+					for node.LastApplied < node.CommitIndex {
+						nextApp := node.LastApplied + 1
+						
+						// Airtight Bounds Check: If the index is out of range, stop completely
+						if nextApp >= len(node.Log) || nextApp < 0 {
+							break 
+						}
+						
+						// Double-Check Check: Ensure the underlying slice index isn't empty
+						if len(node.Log) == 0 {
+							break
+						}
+						
+						node.LastApplied = nextApp
+						entry := node.Log[node.LastApplied]
+						
+						var taskID, workerID int
+						if strings.HasPrefix(entry.Command, "Assign-Map-") {
+							fmt.Sscanf(entry.Command, "Assign-Map-%d-Worker-%d", &taskID, &workerID)
+							shared.MapTasks[taskID] = 1
+						} else if strings.HasPrefix(entry.Command, "Complete-Map-") {
+							fmt.Sscanf(entry.Command, "Complete-Map-%d", &taskID)
+							shared.MapTasks[taskID] = 2
+						} else if strings.HasPrefix(entry.Command, "Assign-Reduce-") {
+							fmt.Sscanf(entry.Command, "Assign-Reduce-%d-Worker-%d", &taskID, &workerID)
+							shared.ReduceTasks[taskID] = 1
+						} else if strings.HasPrefix(entry.Command, "Complete-Reduce-") {
+							fmt.Sscanf(entry.Command, "Complete-Reduce-%d", &taskID)
+							shared.ReduceTasks[taskID] = 2
+						}
+					}
+				}
+			}
+
+			// Send back an unblocked success confirmation to the leader's tracker
+			successReply := shared.RAFTRequest{
+				To:           req.From,
+				From:         id,
+				Term:         node.Term,
+				Type:         3,
+				Success:      true,
+				PrevLogIndex: req.PrevLogIndex + len(req.Entries),
+			}
+			var b bool
+			server.Call("RAFTRequests.Add", successReply, &b)
+			
+			// Safe release of resource lock
+			shared.MRMutex.Unlock()
+		case 3: // Follower Replication Response
+			if node.State != 2 { // Only leaders care about replication confirmations
+				continue
+			}
+
+			if req.Success {
+				// Follower successfully appended the entries
+				node.MatchIndex[req.From] = req.PrevLogIndex
+				node.NextIndex[req.From] = req.PrevLogIndex + 1
+				
+				// Check if this entry is now committed by a majority
+				for N := len(node.Log) - 1; N > node.CommitIndex; N-- {
+					if node.Log[N].Term == node.Term {
+						count := 1 // Count ourselves
+						for _, peerID := range (*membership).Keys() {
+							if peerID != id && node.MatchIndex[peerID] >= N {
+								count++
+							}
+						}
+						if count >= (*membership).Len()/2+1 {
+							node.CommitIndex = N
+							fmt.Printf("LEADER %d: Majority consensus reached! Committed up to index %d\n", id, node.CommitIndex)
+							break
+						}
+					}
+				}
+			} else {
+				// Follower rejected due to log discrepancy; back up NextIndex for this peer
+				if node.NextIndex[req.From] > 0 {
+					node.NextIndex[req.From]--
+				}
+			}
 		}
 	}
 
 	// Check if, as a candidate, majority votes were received
 	if node.State == 1 && node.Votes >= (*membership).Len()/2+1 {
-		// If majority, now a leader
 		node.State = 2
 		(*election_timeout).Stop()
 		fmt.Printf("NODE %d (%.2fs): ELECTED AS LEADER\n", id, time.Since(start).Seconds())
+
+		// Initialize replication tracking states
+		node.NextIndex = make(map[int]int)
+		node.MatchIndex = make(map[int]int)
+		
+		for _, peerID := range (*membership).Keys() {
+			node.NextIndex[peerID] = len(node.Log) // Initialize to leader's last log index
+			node.MatchIndex[peerID] = -1
+		}
 
 
 		// check for dead workers, set those tasks to not started
@@ -286,15 +439,44 @@ func runRAFTHB(server *rpc.Client, node *shared.RAFTNode, membership **shared.Me
 		}()
 	}
 
-	// Broadcast leader ping to all nodes if leader
+	// Broadcast heartbeats / entries if leader
 	if node.State == 2 {
-		req := shared.RAFTRequest{
-			From: id,
-			Term: node.Term,
-			Type: 2,
+		var currentServerLog []shared.LogEntry
+		err := server.Call("Coordinator.GetLog", id, &currentServerLog)
+		if err == nil {
+			node.Log = currentServerLog
 		}
-		broadcastRAFT(server, req, *membership)
-		// fmt.Printf("NODE %d (%.2fs): Leader Broadcast performed\n", id, time.Since(start).Seconds(), req.From)
+
+		for _, receiver := range (*membership).Keys() {
+			if receiver == id {
+				continue
+			}
+
+			prevIndex := node.NextIndex[receiver] - 1
+			prevTerm := -1
+			if prevIndex >= 0 && prevIndex < len(node.Log) {
+				prevTerm = node.Log[prevIndex].Term
+			}
+
+			// Slice entries that this specific follower needs
+			var entriesToSend []shared.LogEntry
+			if node.NextIndex[receiver] >= 0 && node.NextIndex[receiver] < len(node.Log) {
+				entriesToSend = node.Log[node.NextIndex[receiver]:]
+			}
+
+			req := shared.RAFTRequest{
+				To:           receiver,
+				From:         id,
+				Term:         node.Term,
+				Type:         2, // AppendEntries
+				PrevLogIndex: prevIndex,
+				PrevLogTerm:  prevTerm,
+				Entries:      entriesToSend,
+				LeaderCommit: node.CommitIndex,
+			}
+			var reply bool
+			go server.Call("RAFTRequests.Add", req, &reply)
+		}
 	}
 
 	
@@ -408,7 +590,11 @@ func executeSimpleMap(taskID int, filename string, nReduce int, server *rpc.Clie
 
 	// 5. Notify the RAFT Leader that this Map task successfully completed
 	var reply bool
-	args := shared.CompleteTaskArgs{TaskType: 1, TaskID: taskID}
+	args := shared.CompleteTaskArgs{
+		TaskType: 1, 
+		TaskID:   taskID, 
+		Term:     self_RAFT_node.Term, 
+	}
 	server.Call("Coordinator.CompleteTask", &args, &reply)
 }
 
@@ -474,7 +660,11 @@ func executeSimpleReduce(taskID int, nMap int, server *rpc.Client) {
 
 	// 5. Notify the RAFT Leader that this Reduce task successfully completed
 	var reply bool
-	args := shared.CompleteTaskArgs{TaskType: 2, TaskID: taskID}
+	args := shared.CompleteTaskArgs{
+		TaskType: 2, 
+		TaskID:   taskID, 
+		Term:     self_RAFT_node.Term, // <<< ADD THIS FIELD
+	}
 	server.Call("Coordinator.CompleteTask", &args, &reply)
 }
 
@@ -501,7 +691,10 @@ func runWorkerExecutionLoop(server *rpc.Client, id int) {
 		
 		go func() {
 			var reply shared.TaskReply
-			args := shared.TaskRequest{WorkerID: id}
+			args := shared.TaskRequest{
+				WorkerID: id,
+				Term:     self_RAFT_node.Term,
+			}
 			
 			err := server.Call("Coordinator.GiveOutTask", &args, &reply)
 			if err == nil {
