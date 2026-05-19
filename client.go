@@ -34,7 +34,7 @@ var isWorking = false
 
 var start time.Time = time.Now()
 var self_node shared.Node
-var self_RAFT_node shared.RAFTNode
+var self_RAFT_node *shared.RAFTNode //need to make this a pointer so we can pass it around
 var election_timeout *time.Timer
 
 
@@ -43,12 +43,8 @@ func broadcastRAFT(server *rpc.Client, req shared.RAFTRequest, membership *share
 		if receiver == req.From {
 			continue
 		}
-		newReq := shared.RAFTRequest{
-			To:   receiver,
-			From: req.From,
-			Term: req.Term,
-			Type: req.Type,
-		}
+		newReq := req
+		newReq.To = receiver //send to this reciever
 		var reply bool
 		go server.Call("RAFTRequests.Add", newReq, &reply)
 	}
@@ -125,7 +121,15 @@ func main() {
 	currTime := calcTime()
 	// Construct self
 	self_node = shared.Node{ID: id, Hbcounter: 0, Time: currTime, Alive: true}
-	self_RAFT_node = shared.RAFTNode{State: 0, Term: 0, Vote: 0, Votes: 0}
+	self_RAFT_node = &shared.RAFTNode{
+		State: 0,
+		Term: 0,
+		Vote: 0,
+		Votes: 0,
+		Log: []shared.LogEntry{},
+		CommitIndex: -1,
+		LastApplied: -1,
+		}
 	var self_node_response shared.Node // Allocate space for a response to overwrite this
 
 	// Add node with input ID
@@ -151,8 +155,8 @@ func main() {
 
 	// Delaying the election until the membership table is probably filled
 	fmt.Printf("Waiting %d seconds for the membership list to fill out...\n", RAFT_DELAY)
-	election_timeout = time.AfterFunc(time.Second*RAFT_DELAY+time.Millisecond*time.Duration(rand.Float32()*(CAND_TIME_MAX-CAND_TIME_MIN)+CAND_TIME_MIN), func() { runElectionLoop(server, &self_RAFT_node, &membership, id, &election_timeout) })
-	time.AfterFunc(time.Millisecond*RAFT_HB, func() { runRAFTHB(server, &self_RAFT_node, &membership, id, &election_timeout) })
+	election_timeout = time.AfterFunc(time.Second*RAFT_DELAY+time.Millisecond*time.Duration(rand.Float32()*(CAND_TIME_MAX-CAND_TIME_MIN)+CAND_TIME_MIN), func() { runElectionLoop(server, self_RAFT_node, &membership, id, &election_timeout) })
+	time.AfterFunc(time.Millisecond*RAFT_HB, func() { runRAFTHB(server, self_RAFT_node, &membership, id, &election_timeout) })
 
 	//dedicated worker loop
 	time.AfterFunc(time.Second*RAFT_DELAY, func() { runWorkerExecutionLoop(server, id) })
@@ -162,7 +166,7 @@ func main() {
 }
 
 func runElectionLoop(server *rpc.Client, node *shared.RAFTNode, membership **shared.Membership, id int, election_timeout **time.Timer) {
-	// CRITICAL FIX: Stop the old timer if it exists before assigning a new one
+	//Stop the old timer if it exists before assigning a new one
 	if *election_timeout != nil {
 		(*election_timeout).Stop()
 	}
@@ -251,6 +255,40 @@ func runRAFTHB(server *rpc.Client, node *shared.RAFTNode, membership **shared.Me
 			node.Leader = req.From
 
 			(*election_timeout).Reset(time.Millisecond * time.Duration(rand.Float32()*(CAND_TIME_MAX-CAND_TIME_MIN)+CAND_TIME_MIN))
+		case 3: //follower replication confirmation
+			if node.State != 2 {
+				continue //dont care if Im not the leader
+			}
+
+			if req.Success {
+				node.MatchIndex[req.From] = req.PrevLogIndex
+				node.NextIndex[req.From] = req.PrevLogIndex + 1
+				for N := len(node.Log) - 1; N > node.CommitIndex; N-- {
+					// We must only commit logs generated during our active term
+					if node.Log[N].Term == node.Term {
+						count := 1 // Start at 1 to count ourselves (the leader)
+						for _, peerID := range (*membership).Keys() {
+							if peerID != id && node.MatchIndex[peerID] >= N {
+								count++ //cont it if its not us and it is caught up to here
+							}
+						}
+						
+						// If a  majority of the cluster confirmed it, commit it!
+						if count >= (*membership).Len()/2+1 {
+							node.CommitIndex = N
+							fmt.Printf("LEADER %d: Majority consensus reached. Committed up to log index %d\n", id, node.CommitIndex)
+							break
+						}
+					}
+				}
+
+			} else {
+				//follower rejected, back up to next most recent
+				//this will happen until we reach consensus
+				if node.NextIndex[req.From] > 0 {
+					node.NextIndex[req.From]--
+				}
+			}
 		}
 	}
 
@@ -261,6 +299,13 @@ func runRAFTHB(server *rpc.Client, node *shared.RAFTNode, membership **shared.Me
 		(*election_timeout).Stop()
 		fmt.Printf("NODE %d (%.2fs): ELECTED AS LEADER\n", id, time.Since(start).Seconds())
 
+		//init log stuff
+		node.NextIndex = make(map[int]int)
+		node.MatchIndex = make(map[int]int)
+		for _, peerID := range (*membership).Keys() {
+			node.NextIndex[peerID] = len(node.Log) // Default to leader's current log length
+			node.MatchIndex[peerID] = -1           // Peer starts with no confirmed matches
+		}
 
 		// check for dead workers, set those tasks to not started
 		go func() {
@@ -288,16 +333,50 @@ func runRAFTHB(server *rpc.Client, node *shared.RAFTNode, membership **shared.Me
 
 	// Broadcast leader ping to all nodes if leader
 	if node.State == 2 {
-		req := shared.RAFTRequest{
-			From: id,
-			Term: node.Term,
-			Type: 2,
+		var masterServerLog []shared.LogEntry
+		err := server.Call("Coordinator.GetLog", id, &masterServerLog)
+		if err == nil {
+			node.Log = masterServerLog //make our log the most recent master log
 		}
-		broadcastRAFT(server, req, *membership)
-		// fmt.Printf("NODE %d (%.2fs): Leader Broadcast performed\n", id, time.Since(start).Seconds(), req.From)
-	}
 
-	
+		//compute log slices for each follower
+		for _, receiver := range (*membership).Keys() {
+			if receiver == id {
+				continue //skip me, Im the leader
+			}
+
+			// Look up what log entry immediately precedes the slice we are sending
+			pIdx := node.NextIndex[receiver] - 1
+			pTerm := -1
+			if pIdx >= 0 && pIdx < len(node.Log) {
+				pTerm = node.Log[pIdx].Term
+			}
+
+			// Slice the exact log subset that this specific follower is missing
+			var entriesToSend []shared.LogEntry
+			if node.NextIndex[receiver] >= 0 && node.NextIndex[receiver] < len(node.Log) {
+				entriesToSend = node.Log[node.NextIndex[receiver]:]
+			} else if node.NextIndex[receiver] == len(node.Log) {
+				entriesToSend = []shared.LogEntry{} // Follower caught up send empty
+			}
+
+			// Package the complete, consistency-checked payload frame
+			req := shared.RAFTRequest{
+				To:           receiver,
+				From:         id,
+				Term:         node.Term,
+				Type:         2, // AppendEntries Frame
+				PrevLogIndex: pIdx,
+				PrevLogTerm:  pTerm,
+				Entries:      entriesToSend,
+				LeaderCommit: node.CommitIndex,
+			}
+
+			// Fire the packet asynchronously over our network wrapper
+			var reply bool
+			go server.Call("RAFTRequests.Add", req, &reply)
+		}
+	}
 }
 
 func runAfterX(server *rpc.Client, node *shared.Node, membership **shared.Membership, id int) {

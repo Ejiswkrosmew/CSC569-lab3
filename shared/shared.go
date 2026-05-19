@@ -14,6 +14,11 @@ const (
 
 //-- map reduce stuff
 
+type LogEntry struct {
+	Entry string // "Assignmap-0-worker2"
+	Term int //election term
+}
+
 var InputFiles = []string{"pg-being_ernest.txt", "pg-metamorphosis.txt"}
 var NReduce = 3
 
@@ -24,7 +29,9 @@ var TaskTimestamps map[string]time.Time
 
 var MRMutex sync.Mutex
 
-type Coordinator struct{} //for registering to server
+type Coordinator struct{
+	Log []LogEntry //centralized log
+} //for registering to server
 
 type TaskRequest struct {
 	WorkerID int
@@ -50,6 +57,12 @@ type RAFTNode struct {
 	Vote   int
 	Votes  int
 	Leader int
+	Log []LogEntry //log
+	CommitIndex int //index of highest entry committed
+	LastApplied int //index of highest entry applied to state machine
+	//for the leader
+	NextIndex map[int]int //next entry to send to each peer
+	MatchIndex map[int]int //highest mirrored per peer
 }
 
 /*---------------*/
@@ -217,6 +230,11 @@ type RAFTRequest struct {
 	From int
 	Term int
 	Type int // 0: request, 1: vote, 2: leader-ping
+	PrevLogIndex int //index of entry just before new ones
+	PrevLogTerm int //term of above
+	Entries []LogEntry //logs to store
+	LeaderCommit int //leaders commit index
+	Success bool //follower replication status reply
 }
 
 type RAFTRequests struct {
@@ -376,13 +394,18 @@ func (c *Coordinator) GiveOutTask(args *TaskRequest, reply *TaskReply) error {
 	allMapsDone := true
 	for i, status := range MapTasks {
 		if status == 0 { // Idle
-			MapTasks[i] = 1 // Mark In Progress
-			TaskTimestamps[fmt.Sprintf("map-%d", i)] = time.Now()
+			//instead of just changing state we have
+			//to do the log stuff
+			c.Log = append(c.Log, LogEntry{
+				Entry: fmt.Sprintf("Assign-Map-%d-Worker-%d", i, args.WorkerID),
+				Term: 0, //will be updated later by leader
+			})
 
 			reply.TaskType = 1
 			reply.TaskID = i
 			reply.Filename = InputFiles[i]
 			reply.NReduce = NReduce
+			fmt.Printf("Leader State Machine: Logged staging of Map Task %d\n", i)
 			return nil
 		}
 		if status != 2 {
@@ -400,12 +423,15 @@ func (c *Coordinator) GiveOutTask(args *TaskRequest, reply *TaskReply) error {
 	// 3. Check Reduce Phase
 	for i, status := range ReduceTasks {
 		if status == 0 { // Idle
-			ReduceTasks[i] = 1 // Mark In Progress
-			TaskTimestamps[fmt.Sprintf("reduce-%d", i)] = time.Now()
+			c.Log = append(c.Log, LogEntry{
+				Entry: fmt.Sprintf("Assign-Reduce-%d-Worker-%d", i, args.WorkerID),
+				Term:    0,
+			})
 
 			reply.TaskType = 2
 			reply.TaskID = i
 			reply.NMap = len(InputFiles)
+			fmt.Printf("Leader State Machine: Logged staging of Reduce Task %d\n", i)
 			return nil
 		}
 	}
@@ -422,15 +448,31 @@ func (c *Coordinator) CompleteTask(args *CompleteTaskArgs, reply *bool) error {
 
 	//rmark map done
 	if args.TaskType == 1 {
-		MapTasks[args.TaskID] = 2
-		delete(TaskTimestamps, fmt.Sprintf("map-%d", args.TaskID))
+		c.Log = append(c.Log, LogEntry{
+			Entry: fmt.Sprintf("Complete-Map-%d", args.TaskID),
+			Term:    0,
+		})
+		fmt.Printf("Leader State Machine: Logged completion intent for Map Task %d\n", args.TaskID)
 	//mark reduce done
 	} else if args.TaskType == 2 {
-		ReduceTasks[args.TaskID] = 2
-		delete(TaskTimestamps, fmt.Sprintf("reduce-%d", args.TaskID))
+		c.Log = append(c.Log, LogEntry{
+			Entry: fmt.Sprintf("Complete-Reduce-%d", args.TaskID),
+			Term:    0,
+		})
+		fmt.Printf("Leader State Machine: Logged completion intent for Reduce Task %d\n", args.TaskID)
 	}
 
 	*reply = true
+	return nil
+}
+
+// GetLog allows the client-side RAFT Leader node to pull down staged logs from the server
+func (c *Coordinator) GetLog(args int, reply *[]LogEntry) error {
+	MRMutex.Lock()
+	defer MRMutex.Unlock()
+	
+	// Create a deep slice copy to prevent concurrent thread manipulation race conditions
+	*reply = append([]LogEntry{}, c.Log...)
 	return nil
 }
 
