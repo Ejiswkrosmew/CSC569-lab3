@@ -345,25 +345,6 @@ func runRAFTHB(server *rpc.Client, node *shared.RAFTNode, membership **shared.Me
 								shared.ReduceTasks[taskId] = 2
 							}
 						}
-						// var taskID, workerID int
-						// // Match against your field named "Entry"
-						// if strings.HasPrefix(entry.Entry, "Assign-Map-") {
-						// 	fmt.Sscanf(entry.Entry, "Assign-Map-%d-Worker-%d", &taskID, &workerID)
-						// 	shared.MapTasks[taskID] = 1
-						// 	shared.TaskTimestamps[fmt.Sprintf("map-%d", taskID)] = time.Now()
-						// } else if strings.HasPrefix(entry.Entry, "Complete-Map-") {
-						// 	fmt.Sscanf(entry.Entry, "Complete-Map-%d", &taskID)
-						// 	shared.MapTasks[taskID] = 2
-						// 	delete(shared.TaskTimestamps, fmt.Sprintf("map-%d", taskID))
-						// } else if strings.HasPrefix(entry.Entry, "Assign-Reduce-") {
-						// 	fmt.Sscanf(entry.Entry, "Assign-Reduce-%d-Worker-%d", &taskID, &workerID)
-						// 	shared.ReduceTasks[taskID] = 1
-						// 	shared.TaskTimestamps[fmt.Sprintf("reduce-%d", taskID)] = time.Now()
-						// } else if strings.HasPrefix(entry.Entry, "Complete-Reduce-") {
-						// 	fmt.Sscanf(entry.Entry, "Complete-Reduce-%d", &taskID)
-						// 	shared.ReduceTasks[taskID] = 2
-						// 	delete(shared.TaskTimestamps, fmt.Sprintf("reduce-%d", taskID))
-						// }
 					}
 				}
 			}
@@ -395,7 +376,7 @@ func runRAFTHB(server *rpc.Client, node *shared.RAFTNode, membership **shared.Me
 						count := 1 // Start at 1 to count ourselves (the leader)
 						for _, peerID := range (*membership).Keys() {
 							if peerID != id && node.MatchIndex[peerID] >= N {
-								count++ //cont it if its not us and it is caught up to here
+								count++ //count it if its not us and it is caught up to here
 							}
 						}
 
@@ -627,12 +608,13 @@ func executeSimpleMap(taskID int, id int, filename string, nReduce int, server *
 	server.Call("Coordinator.CompleteTask", &args, &reply)
 }
 
-func executeSimpleReduce(taskID int, nMap int, server *rpc.Client) {
+func executeSimpleReduce(taskID int, reduceFiles []shared.IntFile, nMap int, server *rpc.Client) {
 	intermediate := []shared.KeyValue{}
 
 	// 1. Collect intermediate files from all Map tasks for this bucket partition ID
-	for _, intFile := range shared.ReduceFiles[taskID] {
+	for _, intFile := range reduceFiles {
 		inName := fmt.Sprintf("mr-%d-%d", intFile.WorkerID, intFile.Partition)
+		fmt.Printf(inName)
 		file, err := os.Open(inName)
 		if err != nil {
 			continue // Safe to skip if a Map task didn't produce keys for this specific bucket
@@ -714,7 +696,7 @@ func runWorkerExecutionLoop(server *rpc.Client, id int) {
 					isWorking = false // Task finished, reset flag
 				case 2: // Reduce Task
 					fmt.Printf("NODE %d: Received Reduce Task %d\n", id, reply.TaskID)
-					executeSimpleReduce(reply.TaskID, reply.NMap, server)
+					executeSimpleReduce(reply.TaskID, reply.ReduceFiles, reply.NMap, server)
 					isWorking = false // Task finished, reset flag
 				default:
 					// Type 0 (Wait) or Type 3 (All Done)

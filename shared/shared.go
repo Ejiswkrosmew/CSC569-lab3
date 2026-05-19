@@ -69,11 +69,12 @@ type TaskRequest struct {
 }
 
 type TaskReply struct {
-	TaskType int // 0 = Wait, 1 = Map, 2 = Reduce, 3 = All Done
-	TaskID   int
-	Filename string
-	NReduce  int
-	NMap     int
+	TaskType    int // 0 = Wait, 1 = Map, 2 = Reduce, 3 = All Done
+	TaskID      int
+	Filename    string
+	NReduce     int
+	NMap        int
+	ReduceFiles []IntFile
 }
 
 type CompleteTaskArgs struct {
@@ -260,12 +261,14 @@ type RAFTRequest struct {
 	To           int
 	From         int
 	Term         int
-	Type         int        // 0: request, 1: vote, 2: leader-ping
-	PrevLogIndex int        //index of entry just before new ones
-	PrevLogTerm  int        //term of above
-	Entries      []LogEntry //logs to store
-	LeaderCommit int        //leaders commit index
-	Success      bool       //follower replication status reply
+	Type         int              // 0: request, 1: vote, 2: leader-ping, 3: follower reply, 4: request job, 5: give job
+	PrevLogIndex int              //index of entry just before new ones
+	PrevLogTerm  int              //term of above
+	Entries      []LogEntry       //logs to store
+	LeaderCommit int              //leaders commit index
+	Success      bool             //follower replication status reply
+	Task         TaskReply        // 5: Task for the worker to do
+	Completed    CompleteTaskArgs // 6
 }
 
 type RAFTRequests struct {
@@ -468,6 +471,7 @@ func (c *Coordinator) GiveOutTask(args *TaskRequest, reply *TaskReply) error {
 			reply.TaskType = 2
 			reply.TaskID = i
 			reply.NMap = len(InputFiles)
+			reply.ReduceFiles = ReduceFiles[i]
 			fmt.Printf("Leader State Machine: Logged staging of Reduce Task %d\n", i)
 			return nil
 		}
