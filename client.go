@@ -16,7 +16,7 @@ import (
 )
 
 const (
-	MAX_NODES     = 4
+	MAX_NODES     = 8
 	X_TIME        = 1
 	Y_TIME        = 2
 	Z_TIME_MAX    = 100
@@ -430,18 +430,16 @@ func runRAFTHB(server *rpc.Client, node *shared.RAFTNode, membership **shared.Me
 			case 1: // map
 				fmt.Printf("NODE %d: Received Map Task %d (%s)\n", id, task.TaskID, task.Filename)
 
-				go func() {
-					executeSimpleMap(task.TaskID, id, task.Filename, task.NReduce, server)
-					isWorking = false
-				}()
+				
+				executeSimpleMap(task.TaskID, id, task.Filename, task.NReduce, server)
+				isWorking = false
+				
 
 			case 2: // reduce
 				fmt.Printf("NODE %d: Received Reduce Task %d\n", id, task.TaskID)
 
-				go func() {
-					executeSimpleReduce(task.TaskID, task.ReduceFiles, task.NMap, server)
-					isWorking = false
-				}()
+				executeSimpleReduce(task.TaskID, task.ReduceFiles, task.NMap, server)
+				isWorking = false
 
 			case 3: // all done
 				fmt.Printf("NODE %d: All MapReduce tasks complete\n", id)

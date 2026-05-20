@@ -9,7 +9,7 @@ import (
 )
 
 const (
-	MAX_NODES = 4
+	MAX_NODES = 8
 )
 
 // Intermediate data structure
@@ -116,22 +116,15 @@ func (n Node) CrashTime() int {
 }
 
 func (n Node) InitializeNeighbors(id int) [2]int {
-	// If you are running exactly nodes 1, 2, 3, and 4:
-	// We want a ring: 1 -> 2 -> 3 -> 4 -> 1
-
-	// Find neighbor ahead
-	next := id + 1
-	if next > 4 {
-		next = 1
+	neighbor1 := RandInt()
+	for neighbor1 == id {
+		neighbor1 = RandInt()
 	}
-
-	// Find neighbor behind
-	prev := id - 1
-	if prev < 1 {
-		prev = 4
+	neighbor2 := RandInt()
+	for neighbor1 == neighbor2 || neighbor2 == id {
+		neighbor2 = RandInt()
 	}
-
-	return [2]int{next, prev}
+	return [2]int{neighbor1, neighbor2}
 }
 
 func RandInt() int {
