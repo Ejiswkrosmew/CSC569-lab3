@@ -164,10 +164,6 @@ func main() {
 	election_timeout = time.AfterFunc(time.Second*RAFT_DELAY+time.Millisecond*time.Duration(rand.Float32()*(CAND_TIME_MAX-CAND_TIME_MIN)+CAND_TIME_MIN), func() { runElectionLoop(server, self_RAFT_node, &membership, id, &election_timeout) })
 	time.AfterFunc(time.Millisecond*RAFT_HB, func() { runRAFTHB(server, self_RAFT_node, &membership, id, &election_timeout) })
 
-	//DONT NEED ANYMORE WE DO THIS IN RAFTHB
-	//dedicated worker loop
-	//time.AfterFunc(time.Second*RAFT_DELAY, func() { runWorkerExecutionLoop(server, id) })
-
 	wg.Add(1)
 	wg.Wait()
 }
@@ -205,7 +201,7 @@ func runElectionLoop(server *rpc.Client, node *shared.RAFTNode, membership **sha
 func runRAFTHB(server *rpc.Client, node *shared.RAFTNode, membership **shared.Membership, id int, election_timeout **time.Timer) {
 	time.AfterFunc(time.Millisecond*RAFT_HB, func() { runRAFTHB(server, node, membership, id, election_timeout) })
 
-	if node.State == 0 && node.Leader != 0 && !isWorking && !alltasksdone{
+	if node.State == 0 && node.Leader != 0 && !isWorking && !alltasksdone {
 		isWorking = true
 		requestJobFromLeader(server, id)
 	}
@@ -736,42 +732,7 @@ func executeSimpleReduce(taskID int, reduceFiles []shared.IntFile, nMap int, ser
 	sendTaskComplete(server, 2, taskID, nil)
 }
 
-// func runWorkerExecutionLoop(server *rpc.Client, id int) {
-// 	// Re-queue this function to evaluate every 500ms
-// 	time.AfterFunc(500*time.Millisecond, func() { runWorkerExecutionLoop(server, id) })
-
-// 	// Only request tasks if I am a healthy follower, I know who the leader is, and I am not busy
-// 	if self_RAFT_node.State == 0 && self_RAFT_node.Leader != 0 && !isWorking {
-// 		isWorking = true
-
-// 		go func() {
-// 			var reply shared.TaskReply
-// 			args := shared.TaskRequest{WorkerID: id}
-
-// 			err := server.Call("Coordinator.GiveOutTask", &args, &reply)
-// 			if err == nil {
-// 				switch reply.TaskType {
-// 				case 1: // Map Task
-// 					fmt.Printf("NODE %d: Received Map Task %d (%s)\n", id, reply.TaskID, reply.Filename)
-// 					executeSimpleMap(reply.TaskID, id, reply.Filename, reply.NReduce, server)
-// 					isWorking = false // Task finished, reset flag
-// 				case 2: // Reduce Task
-// 					fmt.Printf("NODE %d: Received Reduce Task %d\n", id, reply.TaskID)
-// 					executeSimpleReduce(reply.TaskID, reply.ReduceFiles, reply.NMap, server)
-// 					isWorking = false // Task finished, reset flag
-// 				default:
-// 					// Type 0 (Wait) or Type 3 (All Done)
-// 					isWorking = false
-// 				}
-// 			} else {
-// 				// Server error or connection dropped temporarily
-// 				isWorking = false
-// 			}
-// 		}()
-// 	}
-// }
-
-//send request type four
+// send request type four
 func requestJobFromLeader(server *rpc.Client, id int) {
 	if self_RAFT_node.Leader == 0 {
 		return
@@ -805,7 +766,7 @@ func sendTaskComplete(server *rpc.Client, taskType int, taskID int, newFiles []s
 	server.Call("RAFTRequests.Add", req, &reply)
 }
 
-//called by leader to determine task to assign
+// called by leader to determine task to assign
 func giveOutTaskFromLeader(node *shared.RAFTNode, workerID int) shared.TaskReply {
 	shared.MRMutex.Lock()
 	defer shared.MRMutex.Unlock()
