@@ -30,6 +30,7 @@ const (
 )
 
 var isWorking = false
+var alltasksdone = false
 
 var start time.Time = time.Now()
 var self_node shared.Node
@@ -163,8 +164,9 @@ func main() {
 	election_timeout = time.AfterFunc(time.Second*RAFT_DELAY+time.Millisecond*time.Duration(rand.Float32()*(CAND_TIME_MAX-CAND_TIME_MIN)+CAND_TIME_MIN), func() { runElectionLoop(server, self_RAFT_node, &membership, id, &election_timeout) })
 	time.AfterFunc(time.Millisecond*RAFT_HB, func() { runRAFTHB(server, self_RAFT_node, &membership, id, &election_timeout) })
 
+	//DONT NEED ANYMORE WE DO THIS IN RAFTHB
 	//dedicated worker loop
-	time.AfterFunc(time.Second*RAFT_DELAY, func() { runWorkerExecutionLoop(server, id) })
+	//time.AfterFunc(time.Second*RAFT_DELAY, func() { runWorkerExecutionLoop(server, id) })
 
 	wg.Add(1)
 	wg.Wait()
@@ -202,6 +204,11 @@ func runElectionLoop(server *rpc.Client, node *shared.RAFTNode, membership **sha
 
 func runRAFTHB(server *rpc.Client, node *shared.RAFTNode, membership **shared.Membership, id int, election_timeout **time.Timer) {
 	time.AfterFunc(time.Millisecond*RAFT_HB, func() { runRAFTHB(server, node, membership, id, election_timeout) })
+
+	if node.State == 0 && node.Leader != 0 && !isWorking && !alltasksdone{
+		isWorking = true
+		requestJobFromLeader(server, id)
+	}
 
 	var reply []shared.RAFTRequest
 	server.Call("RAFTRequests.Listen", id, &reply)
@@ -396,6 +403,64 @@ func runRAFTHB(server *rpc.Client, node *shared.RAFTNode, membership **shared.Me
 					node.NextIndex[req.From]--
 				}
 			}
+		case 4: // request job
+			if node.State != 2 {
+				continue //only leader responds to requests for jobs
+			}
+
+			task := giveOutTaskFromLeader(node, req.From)
+
+			response := shared.RAFTRequest{
+				To:   req.From,
+				From: id,
+				Term: node.Term,
+				Type: 5, //assign job
+				Task: task,
+			}
+
+			var reply bool
+			server.Call("RAFTRequests.Add", response, &reply)
+		case 5: // give job
+			task := req.Task //grab from request the job being assigned
+
+			switch task.TaskType {
+			case 0: // wait
+				isWorking = false
+
+			case 1: // map
+				fmt.Printf("NODE %d: Received Map Task %d (%s)\n", id, task.TaskID, task.Filename)
+
+				go func() {
+					executeSimpleMap(task.TaskID, id, task.Filename, task.NReduce, server)
+					isWorking = false
+				}()
+
+			case 2: // reduce
+				fmt.Printf("NODE %d: Received Reduce Task %d\n", id, task.TaskID)
+
+				go func() {
+					executeSimpleReduce(task.TaskID, task.ReduceFiles, task.NMap, server)
+					isWorking = false
+				}()
+
+			case 3: // all done
+				fmt.Printf("NODE %d: All MapReduce tasks complete\n", id)
+				isWorking = false
+				alltasksdone = true
+			}
+		case 6: // job done
+			if node.State != 2 {
+				continue
+			}
+
+			node.Log = append(node.Log, shared.LogEntry{
+				Type:   req.Completed.TaskType - 1, //defined types different on log and req so have to subtract one
+				Status: 1,
+				ID:     req.Completed.TaskID,
+				Term:   node.Term,
+			})
+
+			completeTaskOnLeader(req.Completed)
 		}
 	}
 
@@ -440,18 +505,18 @@ func runRAFTHB(server *rpc.Client, node *shared.RAFTNode, membership **shared.Me
 
 	// Broadcast leader ping to all nodes if leader
 	if node.State == 2 {
-		var masterServerLog []shared.LogEntry
-		err := server.Call("Coordinator.GetLog", node.CommitIndex, &masterServerLog)
-		if err == nil {
-			node.Log = masterServerLog //make our log the most recent master log
+		// var masterServerLog []shared.LogEntry
+		// err := server.Call("Coordinator.GetLog", node.CommitIndex, &masterServerLog)
+		// if err == nil {
+		// 	node.Log = masterServerLog //make our log the most recent master log
 
-			//correction for term zero -> current term
-			for idx := range node.Log {
-				if node.Log[idx].Term == 0 {
-					node.Log[idx].Term = node.Term
-				}
-			}
-		}
+		// 	//correction for term zero -> current term
+		// 	for idx := range node.Log {
+		// 		if node.Log[idx].Term == 0 {
+		// 			node.Log[idx].Term = node.Term
+		// 		}
+		// 	}
+		// }
 
 		//compute log slices for each follower
 		for _, receiver := range (*membership).Keys() {
@@ -603,9 +668,7 @@ func executeSimpleMap(taskID int, id int, filename string, nReduce int, server *
 	}
 
 	// 5. Notify the RAFT Leader that this Map task successfully completed
-	var reply bool
-	args := shared.CompleteTaskArgs{TaskType: 1, TaskID: taskID, NewFiles: newFiles}
-	server.Call("Coordinator.CompleteTask", &args, &reply)
+	sendTaskComplete(server, 1, taskID, newFiles)
 }
 
 func executeSimpleReduce(taskID int, reduceFiles []shared.IntFile, nMap int, server *rpc.Client) {
@@ -670,42 +733,163 @@ func executeSimpleReduce(taskID int, reduceFiles []shared.IntFile, nMap int, ser
 	ofile.Close()
 
 	// 5. Notify the RAFT Leader that this Reduce task successfully completed
-	var reply bool
-	args := shared.CompleteTaskArgs{TaskType: 2, TaskID: taskID}
-	server.Call("Coordinator.CompleteTask", &args, &reply)
+	sendTaskComplete(server, 2, taskID, nil)
 }
 
-func runWorkerExecutionLoop(server *rpc.Client, id int) {
-	// Re-queue this function to evaluate every 500ms
-	time.AfterFunc(500*time.Millisecond, func() { runWorkerExecutionLoop(server, id) })
+// func runWorkerExecutionLoop(server *rpc.Client, id int) {
+// 	// Re-queue this function to evaluate every 500ms
+// 	time.AfterFunc(500*time.Millisecond, func() { runWorkerExecutionLoop(server, id) })
 
-	// Only request tasks if I am a healthy follower, I know who the leader is, and I am not busy
-	if self_RAFT_node.State == 0 && self_RAFT_node.Leader != 0 && !isWorking {
-		isWorking = true
+// 	// Only request tasks if I am a healthy follower, I know who the leader is, and I am not busy
+// 	if self_RAFT_node.State == 0 && self_RAFT_node.Leader != 0 && !isWorking {
+// 		isWorking = true
 
-		go func() {
-			var reply shared.TaskReply
-			args := shared.TaskRequest{WorkerID: id}
+// 		go func() {
+// 			var reply shared.TaskReply
+// 			args := shared.TaskRequest{WorkerID: id}
 
-			err := server.Call("Coordinator.GiveOutTask", &args, &reply)
-			if err == nil {
-				switch reply.TaskType {
-				case 1: // Map Task
-					fmt.Printf("NODE %d: Received Map Task %d (%s)\n", id, reply.TaskID, reply.Filename)
-					executeSimpleMap(reply.TaskID, id, reply.Filename, reply.NReduce, server)
-					isWorking = false // Task finished, reset flag
-				case 2: // Reduce Task
-					fmt.Printf("NODE %d: Received Reduce Task %d\n", id, reply.TaskID)
-					executeSimpleReduce(reply.TaskID, reply.ReduceFiles, reply.NMap, server)
-					isWorking = false // Task finished, reset flag
-				default:
-					// Type 0 (Wait) or Type 3 (All Done)
-					isWorking = false
-				}
-			} else {
-				// Server error or connection dropped temporarily
-				isWorking = false
+// 			err := server.Call("Coordinator.GiveOutTask", &args, &reply)
+// 			if err == nil {
+// 				switch reply.TaskType {
+// 				case 1: // Map Task
+// 					fmt.Printf("NODE %d: Received Map Task %d (%s)\n", id, reply.TaskID, reply.Filename)
+// 					executeSimpleMap(reply.TaskID, id, reply.Filename, reply.NReduce, server)
+// 					isWorking = false // Task finished, reset flag
+// 				case 2: // Reduce Task
+// 					fmt.Printf("NODE %d: Received Reduce Task %d\n", id, reply.TaskID)
+// 					executeSimpleReduce(reply.TaskID, reply.ReduceFiles, reply.NMap, server)
+// 					isWorking = false // Task finished, reset flag
+// 				default:
+// 					// Type 0 (Wait) or Type 3 (All Done)
+// 					isWorking = false
+// 				}
+// 			} else {
+// 				// Server error or connection dropped temporarily
+// 				isWorking = false
+// 			}
+// 		}()
+// 	}
+// }
+
+//send request type four
+func requestJobFromLeader(server *rpc.Client, id int) {
+	if self_RAFT_node.Leader == 0 {
+		return
+	}
+
+	req := shared.RAFTRequest{
+		To:   self_RAFT_node.Leader,
+		From: id,
+		Term: self_RAFT_node.Term,
+		Type: 4,
+	}
+
+	var reply bool
+	server.Call("RAFTRequests.Add", req, &reply)
+}
+
+func sendTaskComplete(server *rpc.Client, taskType int, taskID int, newFiles []shared.IntFile) {
+	req := shared.RAFTRequest{
+		To:   self_RAFT_node.Leader,
+		From: self_node.ID,
+		Term: self_RAFT_node.Term,
+		Type: 6,
+		Completed: shared.CompleteTaskArgs{
+			TaskType: taskType,
+			TaskID:   taskID,
+			NewFiles: newFiles,
+		},
+	}
+
+	var reply bool
+	server.Call("RAFTRequests.Add", req, &reply)
+}
+
+//called by leader to determine task to assign
+func giveOutTaskFromLeader(node *shared.RAFTNode, workerID int) shared.TaskReply {
+	shared.MRMutex.Lock()
+	defer shared.MRMutex.Unlock()
+
+	fmt.Printf("Leader: Received TaskRequest from Worker %d\n", workerID)
+
+	allMapsDone := true
+
+	for i, status := range shared.MapTasks {
+		if status == 0 {
+			node.Log = append(node.Log, shared.LogEntry{
+				Type:     0,
+				Status:   0,
+				ID:       i,
+				WorkerID: workerID,
+				Term:     node.Term,
+			})
+
+			shared.MapTasks[i] = 1
+			shared.TaskTimestamps[fmt.Sprintf("map-%d", i)] = time.Now()
+
+			return shared.TaskReply{
+				TaskType: 1,
+				TaskID:   i,
+				Filename: shared.InputFiles[i],
+				NReduce:  shared.NReduce,
 			}
-		}()
+		}
+
+		if status != 2 {
+			allMapsDone = false
+		}
+	}
+
+	if !allMapsDone {
+		return shared.TaskReply{TaskType: 0}
+	}
+
+	for i, status := range shared.ReduceTasks {
+		if status == 0 {
+			node.Log = append(node.Log, shared.LogEntry{
+				Type:     1,
+				Status:   0,
+				ID:       i,
+				WorkerID: workerID,
+				Term:     node.Term,
+			})
+
+			shared.ReduceTasks[i] = 1
+			shared.TaskTimestamps[fmt.Sprintf("reduce-%d", i)] = time.Now()
+
+			return shared.TaskReply{
+				TaskType:    2,
+				TaskID:      i,
+				NMap:        len(shared.InputFiles),
+				ReduceFiles: shared.ReduceFiles[i],
+			}
+		}
+	}
+
+	return shared.TaskReply{TaskType: 3}
+}
+
+func completeTaskOnLeader(args shared.CompleteTaskArgs) {
+	shared.MRMutex.Lock()
+	defer shared.MRMutex.Unlock()
+
+	if args.TaskType == 1 {
+		if args.TaskID >= 0 && args.TaskID < len(shared.MapTasks) {
+			shared.MapTasks[args.TaskID] = 2
+			shared.ReduceFiles[args.TaskID] = args.NewFiles
+			delete(shared.TaskTimestamps, fmt.Sprintf("map-%d", args.TaskID))
+
+			fmt.Printf("Leader: Map Task %d completed\n", args.TaskID)
+		}
+		return
+	}
+
+	if args.TaskType == 2 {
+		if args.TaskID >= 0 && args.TaskID < len(shared.ReduceTasks) {
+			shared.ReduceTasks[args.TaskID] = 2
+			delete(shared.TaskTimestamps, fmt.Sprintf("reduce-%d", args.TaskID))
+
+			fmt.Printf("Leader: Reduce Task %d completed\n", args.TaskID)
+		}
 	}
 }
